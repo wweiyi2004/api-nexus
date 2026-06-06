@@ -22,6 +22,7 @@ fn main() {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .unwrap(),
+        token_stats: Arc::new(RwLock::new(proxy::TokenStats::default())),
         shutdown_tx: RwLock::new(None),
         server_task: RwLock::new(None),
         running: Arc::new(RwLock::new(false)),
@@ -36,6 +37,8 @@ fn main() {
             commands::update_provider,
             commands::remove_provider,
             commands::get_server_status,
+            commands::get_token_stats,
+            commands::reset_token_stats,
             commands::start_proxy,
             commands::stop_proxy,
             commands::test_provider,

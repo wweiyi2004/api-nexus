@@ -2,12 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   Boxes,
   CheckCircle2,
   Clipboard,
+  Database,
+  Hash,
   KeyRound,
   Pause,
   Play,
+  RefreshCw,
   Server,
   ShieldCheck,
   Split,
@@ -28,6 +33,13 @@ interface AppConfig {
   proxy_api_key: string;
 }
 
+interface TokenStats {
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+}
+
 interface Provider {
   id: string;
   name: string;
@@ -43,21 +55,28 @@ function unique<T>(items: T[]) {
   return Array.from(new Set(items));
 }
 
+function formatTokens(value: number) {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
 export default function Dashboard() {
   const [status, setStatus] = useState<ServerStatus | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [tokenStats, setTokenStats] = useState<TokenStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
   const fetchData = async () => {
     try {
-      const [serverStatus, appConfig] = await Promise.all([
+      const [serverStatus, appConfig, usageStats] = await Promise.all([
         invoke<ServerStatus>("get_server_status"),
         invoke<AppConfig>("get_config"),
+        invoke<TokenStats>("get_token_stats"),
       ]);
       setStatus(serverStatus);
       setConfig(appConfig);
+      setTokenStats(usageStats);
     } catch (e) {
       console.error(e);
     } finally {
@@ -79,6 +98,17 @@ export default function Dashboard() {
       } else {
         await invoke("start_proxy");
       }
+      await fetchData();
+    } catch (e) {
+      console.error(e);
+      setError(String(e));
+    }
+  };
+
+  const resetTokenStats = async () => {
+    try {
+      setError(null);
+      await invoke("reset_token_stats");
       await fetchData();
     } catch (e) {
       console.error(e);
@@ -185,6 +215,65 @@ export default function Dashboard() {
           <div className="mt-3 flex items-center gap-1 text-xs text-surface-500 dark:text-surface-400">
             <ShieldCheck className="h-3.5 w-3.5" />
             {config?.proxy_api_key ? "统一代理密钥启用" : "请求无需验证"}
+          </div>
+        </div>
+      </section>
+
+      <section className="panel p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Database className="h-4 w-4 text-cyan-600 dark:text-cyan-300" />
+            <h2 className="text-sm font-semibold">Token 用量</h2>
+          </div>
+          <button className="btn-secondary" onClick={resetTokenStats}>
+            <RefreshCw className="h-4 w-4" />
+            清零
+          </button>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+          <div className="rounded-lg border border-surface-200 bg-surface-50 p-3 dark:border-surface-800 dark:bg-surface-950">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="metric-label">Input</div>
+                <div className="mt-2 text-xl font-semibold">
+                  {formatTokens(tokenStats?.input_tokens ?? 0)}
+                </div>
+              </div>
+              <ArrowDown className="h-5 w-5 text-emerald-600 dark:text-emerald-300" />
+            </div>
+          </div>
+          <div className="rounded-lg border border-surface-200 bg-surface-50 p-3 dark:border-surface-800 dark:bg-surface-950">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="metric-label">Output</div>
+                <div className="mt-2 text-xl font-semibold">
+                  {formatTokens(tokenStats?.output_tokens ?? 0)}
+                </div>
+              </div>
+              <ArrowUp className="h-5 w-5 text-sky-600 dark:text-sky-300" />
+            </div>
+          </div>
+          <div className="rounded-lg border border-surface-200 bg-surface-50 p-3 dark:border-surface-800 dark:bg-surface-950">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="metric-label">Cache</div>
+                <div className="mt-2 text-xl font-semibold">
+                  {formatTokens(tokenStats?.cached_tokens ?? 0)}
+                </div>
+              </div>
+              <Database className="h-5 w-5 text-violet-600 dark:text-violet-300" />
+            </div>
+          </div>
+          <div className="rounded-lg border border-surface-200 bg-surface-50 p-3 dark:border-surface-800 dark:bg-surface-950">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="metric-label">Requests</div>
+                <div className="mt-2 text-xl font-semibold">
+                  {formatTokens(tokenStats?.request_count ?? 0)}
+                </div>
+              </div>
+              <Hash className="h-5 w-5 text-amber-600 dark:text-amber-300" />
+            </div>
           </div>
         </div>
       </section>

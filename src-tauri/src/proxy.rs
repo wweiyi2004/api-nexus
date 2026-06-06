@@ -8,6 +8,7 @@ use axum::{
 };
 use futures::StreamExt;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io;
@@ -20,15 +21,67 @@ use crate::config::{AppConfig, Provider};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const PROTOCOL_ANTHROPIC: &str = "anthropic";
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl TokenUsage {
+    fn is_empty(self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cached_tokens == 0
+    }
+
+    fn absorb_max(&mut self, usage: TokenUsage) {
+        self.input_tokens = self.input_tokens.max(usage.input_tokens);
+        self.output_tokens = self.output_tokens.max(usage.output_tokens);
+        self.cached_tokens = self.cached_tokens.max(usage.cached_tokens);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenStats {
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl TokenStats {
+    fn record(&mut self, usage: TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+
+        self.request_count += 1;
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cached_tokens += usage.cached_tokens;
+    }
+}
+
+pub type TokenStatsState = Arc<RwLock<TokenStats>>;
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<RwLock<AppConfig>>,
     pub client: Client,
+    pub token_stats: TokenStatsState,
 }
 
+#[cfg(test)]
 pub fn create_proxy_router(config: Arc<RwLock<AppConfig>>) -> Router {
+    create_proxy_router_with_stats(config, Arc::new(RwLock::new(TokenStats::default())))
+}
+
+pub fn create_proxy_router_with_stats(
+    config: Arc<RwLock<AppConfig>>,
+    token_stats: TokenStatsState,
+) -> Router {
     let state = ProxyState {
         config,
+        token_stats,
         client: Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -257,11 +310,120 @@ fn bad_gateway(message: impl Into<String>) -> Response {
         .into_response()
 }
 
-async fn passthrough_response(resp: reqwest::Response, is_stream: bool) -> Response {
+fn first_u64_field(value: &Value, field_names: &[&str]) -> u64 {
+    field_names
+        .iter()
+        .find_map(|field_name| value.get(*field_name).and_then(Value::as_u64))
+        .unwrap_or_default()
+}
+
+fn sum_cache_token_fields(value: &Value) -> u64 {
+    const CACHE_FIELDS: &[&str] = &[
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_read",
+        "cache_creation",
+        "cache_write",
+    ];
+
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, nested)| {
+                let current = if CACHE_FIELDS.contains(&key.as_str()) {
+                    nested.as_u64().unwrap_or_default()
+                } else {
+                    0
+                };
+                current + sum_cache_token_fields(nested)
+            })
+            .sum(),
+        Value::Array(items) => items.iter().map(sum_cache_token_fields).sum(),
+        _ => 0,
+    }
+}
+
+fn extract_token_usage(value: &Value) -> TokenUsage {
+    let usage = value
+        .get("usage")
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("usage"))
+        })
+        .unwrap_or(value);
+
+    TokenUsage {
+        input_tokens: first_u64_field(usage, &["prompt_tokens", "input_tokens"]),
+        output_tokens: first_u64_field(usage, &["completion_tokens", "output_tokens"]),
+        cached_tokens: sum_cache_token_fields(usage),
+    }
+}
+
+fn extract_token_usage_from_sse_frame(frame: &str) -> TokenUsage {
+    let (_, data) = parse_sse_frame(frame);
+    let Some(data) = data else {
+        return TokenUsage::default();
+    };
+    if data.trim() == "[DONE]" {
+        return TokenUsage::default();
+    }
+
+    serde_json::from_str::<Value>(&data)
+        .map(|value| extract_token_usage(&value))
+        .unwrap_or_default()
+}
+
+async fn record_token_usage(token_stats: &TokenStatsState, usage: TokenUsage) {
+    if usage.is_empty() {
+        return;
+    }
+
+    token_stats.write().await.record(usage);
+}
+
+async fn passthrough_response(
+    resp: reqwest::Response,
+    is_stream: bool,
+    token_stats: TokenStatsState,
+) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
 
     if is_stream {
-        let stream = resp.bytes_stream();
+        let stream = async_stream::stream! {
+            let mut upstream = resp.bytes_stream();
+            let mut buffer = String::new();
+            let mut usage = TokenUsage::default();
+
+            while let Some(chunk) = upstream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let frame = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+                            usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
+                        }
+
+                        yield Ok::<Bytes, io::Error>(bytes);
+                    }
+                    Err(err) => {
+                        yield Err(io::Error::other(err.to_string()));
+                        return;
+                    }
+                }
+            }
+
+            if !buffer.trim().is_empty() {
+                usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
+            }
+
+            record_token_usage(&token_stats, usage).await;
+        };
+
         return Response::builder()
             .status(status)
             .header(
@@ -280,6 +442,10 @@ async fn passthrough_response(resp: reqwest::Response, is_stream: bool) -> Respo
         Ok(bytes) => bytes,
         Err(err) => return bad_gateway(format!("Failed to read upstream response: {}", err)),
     };
+
+    if let Ok(body_json) = serde_json::from_slice::<Value>(&bytes) {
+        record_token_usage(&token_stats, extract_token_usage(&body_json)).await;
+    }
 
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
@@ -955,11 +1121,16 @@ struct OpenAiToolDelta {
     arguments: String,
 }
 
-async fn openai_stream_to_anthropic_response(resp: reqwest::Response, model: String) -> Response {
+async fn openai_stream_to_anthropic_response(
+    resp: reqwest::Response,
+    model: String,
+    token_stats: TokenStatsState,
+) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let stream = async_stream::stream! {
         let mut upstream = resp.bytes_stream();
         let mut buffer = String::new();
+        let mut usage = TokenUsage::default();
         let mut response_id = format!("msg_openai_{}", unix_timestamp());
         let mut sent_start = false;
         let mut text_block_open = false;
@@ -988,6 +1159,7 @@ async fn openai_stream_to_anthropic_response(resp: reqwest::Response, model: Str
                         let Ok(chunk_json) = serde_json::from_str::<Value>(&data) else {
                             continue;
                         };
+                        usage.absorb_max(extract_token_usage(&chunk_json));
 
                         if let Some(id) = chunk_json.get("id").and_then(Value::as_str) {
                             response_id = id.to_string();
@@ -1145,6 +1317,8 @@ async fn openai_stream_to_anthropic_response(resp: reqwest::Response, model: Str
         yield Ok::<Bytes, io::Error>(Bytes::from(anthropic_sse_frame("message_stop", json!({
             "type": "message_stop"
         }))));
+
+        record_token_usage(&token_stats, usage).await;
     };
 
     Response::builder()
@@ -1222,11 +1396,16 @@ fn anthropic_frame_to_openai_chunks(
     }
 }
 
-async fn anthropic_stream_to_openai_response(resp: reqwest::Response, model: String) -> Response {
+async fn anthropic_stream_to_openai_response(
+    resp: reqwest::Response,
+    model: String,
+    token_stats: TokenStatsState,
+) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let stream = async_stream::stream! {
         let mut upstream = resp.bytes_stream();
         let mut buffer = String::new();
+        let mut usage = TokenUsage::default();
         let mut response_id = format!("chatcmpl-anthropic-{}", unix_timestamp());
         let mut sent_done = false;
 
@@ -1237,6 +1416,7 @@ async fn anthropic_stream_to_openai_response(resp: reqwest::Response, model: Str
                     while let Some(pos) = buffer.find("\n\n") {
                         let frame = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
+                        usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
                         for output in anthropic_frame_to_openai_chunks(&frame, &mut response_id, &model) {
                             if output.trim() == "data: [DONE]" {
                                 sent_done = true;
@@ -1253,6 +1433,7 @@ async fn anthropic_stream_to_openai_response(resp: reqwest::Response, model: Str
         }
 
         if !buffer.trim().is_empty() {
+            usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
             for output in anthropic_frame_to_openai_chunks(&buffer, &mut response_id, &model) {
                 if output.trim() == "data: [DONE]" {
                     sent_done = true;
@@ -1264,6 +1445,8 @@ async fn anthropic_stream_to_openai_response(resp: reqwest::Response, model: Str
         if !sent_done {
             yield Ok::<Bytes, io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
         }
+
+        record_token_usage(&token_stats, usage).await;
     };
 
     Response::builder()
@@ -1377,7 +1560,7 @@ async fn anthropic_handler(
                         continue;
                     }
 
-                    return passthrough_response(resp, is_stream).await;
+                    return passthrough_response(resp, is_stream, state.token_stats.clone()).await;
                 }
                 Err(err) => {
                     errors.push(format!("{}: {}", provider.name, err));
@@ -1428,11 +1611,21 @@ async fn anthropic_handler(
                 }
 
                 if is_stream {
-                    return openai_stream_to_anthropic_response(resp, model.clone()).await;
+                    return openai_stream_to_anthropic_response(
+                        resp,
+                        model.clone(),
+                        state.token_stats.clone(),
+                    )
+                    .await;
                 }
 
                 match resp.json::<Value>().await {
                     Ok(openai_response) => {
+                        record_token_usage(
+                            &state.token_stats,
+                            extract_token_usage(&openai_response),
+                        )
+                        .await;
                         return Json(openai_to_anthropic_response(openai_response, &model))
                             .into_response();
                     }
@@ -1571,11 +1764,21 @@ async fn proxy_handler(
                     }
 
                     if is_stream {
-                        return anthropic_stream_to_openai_response(resp, model.clone()).await;
+                        return anthropic_stream_to_openai_response(
+                            resp,
+                            model.clone(),
+                            state.token_stats.clone(),
+                        )
+                        .await;
                     }
 
                     match resp.json::<Value>().await {
                         Ok(anthropic_response) => {
+                            record_token_usage(
+                                &state.token_stats,
+                                extract_token_usage(&anthropic_response),
+                            )
+                            .await;
                             return Json(anthropic_to_openai_response(anthropic_response, &model))
                                 .into_response();
                         }
@@ -1616,7 +1819,7 @@ async fn proxy_handler(
                     continue;
                 }
 
-                return passthrough_response(resp, is_stream).await;
+                return passthrough_response(resp, is_stream, state.token_stats.clone()).await;
             }
             Err(e) => {
                 errors.push(format!("{}: {}", provider.name, e));
@@ -1674,6 +1877,42 @@ mod tests {
             protocol: "anthropic".to_string(),
             ..provider(base_url, priority)
         }
+    }
+
+    #[test]
+    fn token_usage_is_extracted_from_common_provider_shapes() {
+        let openai_usage = extract_token_usage(&json!({
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 34,
+                "prompt_tokens_details": {"cached_tokens": 56}
+            }
+        }));
+        assert_eq!(
+            openai_usage,
+            TokenUsage {
+                input_tokens: 120,
+                output_tokens: 34,
+                cached_tokens: 56
+            }
+        );
+
+        let anthropic_usage = extract_token_usage(&json!({
+            "usage": {
+                "input_tokens": 80,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 12,
+                "cache_read_input_tokens": 40
+            }
+        }));
+        assert_eq!(
+            anthropic_usage,
+            TokenUsage {
+                input_tokens: 80,
+                output_tokens: 20,
+                cached_tokens: 52
+            }
+        );
     }
 
     #[test]
@@ -1795,6 +2034,62 @@ mod tests {
         let body: Value = authorized.json().await.unwrap();
         assert_eq!(body["data"][0]["id"], "test-model");
 
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn token_usage_is_recorded_for_passthrough_responses() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "id": "chatcmpl_usage",
+                    "object": "chat.completion",
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                        "prompt_tokens_details": {"cached_tokens": 5}
+                    }
+                }))
+                .into_response()
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let stats = Arc::new(RwLock::new(TokenStats::default()));
+        let config = AppConfig {
+            providers: vec![provider(format!("http://{}", upstream_addr), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(Arc::new(RwLock::new(config)), stats.clone());
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "test-model",
+                "messages": []
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let _: Value = response.json().await.unwrap();
+
+        let stats = stats.read().await;
+        assert_eq!(stats.request_count, 1);
+        assert_eq!(stats.input_tokens, 11);
+        assert_eq!(stats.output_tokens, 7);
+        assert_eq!(stats.cached_tokens, 5);
+
+        upstream_task.abort();
         proxy_task.abort();
     }
 

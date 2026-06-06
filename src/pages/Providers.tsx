@@ -4,6 +4,8 @@ import {
   CheckCircle2,
   CircleOff,
   FlaskConical,
+  ListChecks,
+  Loader2,
   Network,
   Pencil,
   Plus,
@@ -180,13 +182,33 @@ function responseErrorMessage(body: unknown) {
   return null;
 }
 
+interface ProviderTestResponse {
+  status: number;
+  success: boolean;
+  body?: unknown;
+  model?: string | null;
+}
+
+interface ProviderTestResult {
+  success: boolean;
+  message: string;
+}
+
+function testMessage(result: ProviderTestResponse) {
+  const detail = responseErrorMessage(result.body);
+  return result.success
+    ? `通过 ${result.status}${result.model ? ` · ${result.model}` : ""}`
+    : `失败 ${result.status}${detail ? ` · ${detail}` : ""}`;
+}
+
 export default function Providers() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [editing, setEditing] = useState<Provider | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [modelInput, setModelInput] = useState("");
   const [testing, setTesting] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{ id: string; success: boolean; message: string } | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, ProviderTestResult>>({});
+  const [batchResult, setBatchResult] = useState<ProviderTestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fetchConfig = async () => {
@@ -273,30 +295,110 @@ export default function Providers() {
     }
   };
 
+  const testProvider = async (provider: Provider, model?: string) => {
+    const target = model ? { ...provider, models: [model] } : provider;
+    return invoke<ProviderTestResponse>("test_provider", {
+      provider: target,
+    });
+  };
+
+  const setProviderTestResult = (providerId: string, result: ProviderTestResult) => {
+    setTestResults((current) => ({
+      ...current,
+      [providerId]: result,
+    }));
+  };
+
   const handleTest = async (provider: Provider) => {
     setTesting(provider.id);
     try {
-      const result = await invoke<{
-        status: number;
-        success: boolean;
-        body?: unknown;
-        model?: string | null;
-      }>("test_provider", {
-        provider,
-      });
-      const detail = responseErrorMessage(result.body);
-      setTestResult({
-        id: provider.id,
+      setError(null);
+      setBatchResult(null);
+      const result = await testProvider(provider);
+      setProviderTestResult(provider.id, {
         success: result.success,
-        message: result.success
-          ? `测试通过 ${result.status}${result.model ? ` · ${result.model}` : ""}`
-          : `连接失败 ${result.status}${detail ? ` · ${detail}` : ""}`,
+        message: `连接${testMessage(result)}`,
       });
     } catch (e) {
-      setTestResult({ id: provider.id, success: false, message: String(e) });
+      setProviderTestResult(provider.id, { success: false, message: String(e) });
     } finally {
       setTesting(null);
-      setTimeout(() => setTestResult(null), 3000);
+    }
+  };
+
+  const handleTestModels = async (provider: Provider) => {
+    const key = `${provider.id}:models`;
+    setTesting(key);
+    try {
+      setError(null);
+      setBatchResult(null);
+      if (provider.models.length === 0) {
+        const result = await testProvider(provider);
+        setProviderTestResult(provider.id, {
+          success: result.success,
+          message: `模型列表${testMessage(result)}`,
+        });
+        return;
+      }
+
+      let passed = 0;
+      const failed: string[] = [];
+      for (const model of provider.models) {
+        try {
+          const result = await testProvider(provider, model);
+          if (result.success) {
+            passed += 1;
+          } else {
+            failed.push(model);
+          }
+        } catch {
+          failed.push(model);
+        }
+      }
+
+      const allPassed = failed.length === 0;
+      const failedText = failed.length > 0 ? ` · 失败 ${failed.slice(0, 3).join(", ")}` : "";
+      const moreText = failed.length > 3 ? ` 等 ${failed.length} 个` : "";
+      setProviderTestResult(provider.id, {
+        success: allPassed,
+        message: `模型 ${passed}/${provider.models.length} 通过${failedText}${moreText}`,
+      });
+    } catch (e) {
+      setProviderTestResult(provider.id, { success: false, message: String(e) });
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  const handleTestAllProviders = async () => {
+    const providers = config?.providers ?? [];
+    if (providers.length === 0) return;
+
+    setTesting("all-providers");
+    setBatchResult(null);
+    setTestResults({});
+    try {
+      setError(null);
+      let passed = 0;
+      for (const provider of providers) {
+        try {
+          const result = await testProvider(provider);
+          if (result.success) passed += 1;
+          setProviderTestResult(provider.id, {
+            success: result.success,
+            message: `连接${testMessage(result)}`,
+          });
+        } catch (e) {
+          setProviderTestResult(provider.id, { success: false, message: String(e) });
+        }
+      }
+
+      setBatchResult({
+        success: passed === providers.length,
+        message: `服务商 ${passed}/${providers.length} 通过`,
+      });
+    } finally {
+      setTesting(null);
     }
   };
 
@@ -330,10 +432,32 @@ export default function Providers() {
             服务商
           </h1>
         </div>
-        <button className="btn-primary" onClick={beginCreate}>
-          <Plus className="h-4 w-4" />
-          添加服务商
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {batchResult && (
+            <span
+              className={`badge max-w-full truncate ${batchResult.success ? "badge-success" : "badge-error"}`}
+              title={batchResult.message}
+            >
+              {batchResult.message}
+            </span>
+          )}
+          <button
+            className="btn-secondary"
+            onClick={handleTestAllProviders}
+            disabled={testing !== null || !config?.providers.length}
+          >
+            {testing === "all-providers" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <ListChecks className="h-4 w-4" />
+            )}
+            {testing === "all-providers" ? "测试中" : "测试全部服务商"}
+          </button>
+          <button className="btn-primary" onClick={beginCreate}>
+            <Plus className="h-4 w-4" />
+            添加服务商
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -532,18 +656,37 @@ export default function Providers() {
               </div>
 
               <div className="flex items-center gap-2">
-                {testResult?.id === provider.id && (
-                  <span className={`badge ${testResult.success ? "badge-success" : "badge-error"}`}>
-                    {testResult.message}
+                {testResults[provider.id] && (
+                  <span
+                    className={`badge max-w-[22rem] truncate ${testResults[provider.id].success ? "badge-success" : "badge-error"}`}
+                    title={testResults[provider.id].message}
+                  >
+                    {testResults[provider.id].message}
                   </span>
                 )}
                 <button
                   className="btn-secondary"
                   onClick={() => handleTest(provider)}
-                  disabled={testing === provider.id}
+                  disabled={testing !== null}
                 >
-                  <FlaskConical className="h-4 w-4" />
-                  {testing === provider.id ? "测试中" : "测试"}
+                  {testing === provider.id ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <FlaskConical className="h-4 w-4" />
+                  )}
+                  {testing === provider.id ? "测试中" : "测试连接"}
+                </button>
+                <button
+                  className="btn-secondary"
+                  onClick={() => handleTestModels(provider)}
+                  disabled={testing !== null}
+                >
+                  {testing === `${provider.id}:models` ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <ListChecks className="h-4 w-4" />
+                  )}
+                  {testing === `${provider.id}:models` ? "测试中" : "全部模型"}
                 </button>
                 <button className="btn-icon" onClick={() => beginEdit(provider)} title="编辑">
                   <Pencil className="h-4 w-4" />

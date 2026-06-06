@@ -12,6 +12,7 @@ use tokio::time::{timeout, Duration};
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub client: Client,
+    pub token_stats: proxy::TokenStatsState,
     pub shutdown_tx: RwLock<Option<broadcast::Sender<()>>>,
     pub server_task: RwLock<Option<JoinHandle<()>>>,
     pub running: Arc<RwLock<bool>>,
@@ -106,6 +107,19 @@ pub async fn get_server_status(
     })
 }
 
+#[tauri::command]
+pub async fn get_token_stats(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<proxy::TokenStats, String> {
+    Ok(state.token_stats.read().await.clone())
+}
+
+#[tauri::command]
+pub async fn reset_token_stats(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    *state.token_stats.write().await = proxy::TokenStats::default();
+    Ok(())
+}
+
 pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, String> {
     let running = *state.running.read().await;
     if running {
@@ -122,7 +136,7 @@ pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, Strin
 
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
 
-    let router = proxy::create_proxy_router(config_arc);
+    let router = proxy::create_proxy_router_with_stats(config_arc, state.token_stats.clone());
 
     let listener = TcpListener::bind(&addr)
         .await
