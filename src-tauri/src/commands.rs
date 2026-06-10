@@ -204,34 +204,49 @@ pub async fn stop_proxy(state: tauri::State<'_, Arc<AppState>>) -> Result<(), St
 pub async fn test_provider(
     state: tauri::State<'_, Arc<AppState>>,
     provider: Provider,
+    model: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let client = &state.client;
     let protocol = provider.protocol.to_ascii_lowercase();
-    let test_model = provider.models.first().cloned();
+    let is_anthropic = protocol == "anthropic";
+
+    // Connection tests (no model) hit the cheap model-list endpoint instead of
+    // running a real inference round trip. Anthropic-compatible vendor endpoints
+    // don't always implement /v1/models, so there we fall back to a minimal
+    // 1-token inference when a model is configured.
+    let quick_anthropic_model = if model.is_none() && is_anthropic {
+        provider.models.first().cloned()
+    } else {
+        None
+    };
+
+    let (test_model, max_tokens, timeout_secs) = match (&model, &quick_anthropic_model) {
+        (Some(model), _) => (Some(model.clone()), 8, 20),
+        (None, Some(model)) => (Some(model.clone()), 1, 20),
+        (None, None) => (None, 0, 10),
+    };
 
     let (method, url, body) = if let Some(model) = test_model.clone() {
-        if protocol == "anthropic" {
-            (
-                "POST",
-                proxy::anthropic_upstream_url(&provider.base_url, "/v1/messages"),
-                Some(json!({
-                    "model": model,
-                    "max_tokens": 64,
-                    "messages": [{"role": "user", "content": "Reply exactly: ok"}]
-                })),
-            )
+        let path = if is_anthropic {
+            "/v1/messages"
         } else {
-            (
-                "POST",
-                proxy::openai_upstream_url(&provider.base_url, "/v1/chat/completions"),
-                Some(json!({
-                    "model": model,
-                    "max_tokens": 64,
-                    "messages": [{"role": "user", "content": "Reply exactly: ok"}]
-                })),
-            )
-        }
-    } else if protocol == "anthropic" {
+            "/v1/chat/completions"
+        };
+        let url = if is_anthropic {
+            proxy::anthropic_upstream_url(&provider.base_url, path)
+        } else {
+            proxy::openai_upstream_url(&provider.base_url, path)
+        };
+        (
+            "POST",
+            url,
+            Some(json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "Reply exactly: ok"}]
+            })),
+        )
+    } else if is_anthropic {
         (
             "GET",
             proxy::anthropic_upstream_url(&provider.base_url, "/v1/models"),
@@ -255,6 +270,7 @@ pub async fn test_provider(
     } else {
         client.get(&url)
     };
+    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
 
     if protocol == "anthropic" {
         req = req

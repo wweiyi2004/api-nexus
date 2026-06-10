@@ -296,9 +296,9 @@ export default function Providers() {
   };
 
   const testProvider = async (provider: Provider, model?: string) => {
-    const target = model ? { ...provider, models: [model] } : provider;
     return invoke<ProviderTestResponse>("test_provider", {
-      provider: target,
+      provider,
+      model: model ?? null,
     });
   };
 
@@ -341,20 +341,18 @@ export default function Providers() {
         return;
       }
 
-      let passed = 0;
-      const failed: string[] = [];
-      for (const model of provider.models) {
-        try {
-          const result = await testProvider(provider, model);
-          if (result.success) {
-            passed += 1;
-          } else {
-            failed.push(model);
+      const outcomes = await Promise.all(
+        provider.models.map(async (model) => {
+          try {
+            const result = await testProvider(provider, model);
+            return result.success ? null : model;
+          } catch {
+            return model;
           }
-        } catch {
-          failed.push(model);
-        }
-      }
+        }),
+      );
+      const failed = outcomes.filter((model): model is string => model !== null);
+      const passed = provider.models.length - failed.length;
 
       const allPassed = failed.length === 0;
       const failedText = failed.length > 0 ? ` · 失败 ${failed.slice(0, 3).join(", ")}` : "";
@@ -379,19 +377,22 @@ export default function Providers() {
     setTestResults({});
     try {
       setError(null);
-      let passed = 0;
-      for (const provider of providers) {
-        try {
-          const result = await testProvider(provider);
-          if (result.success) passed += 1;
-          setProviderTestResult(provider.id, {
-            success: result.success,
-            message: `连接${testMessage(result)}`,
-          });
-        } catch (e) {
-          setProviderTestResult(provider.id, { success: false, message: String(e) });
-        }
-      }
+      const outcomes = await Promise.all(
+        providers.map(async (provider) => {
+          try {
+            const result = await testProvider(provider);
+            setProviderTestResult(provider.id, {
+              success: result.success,
+              message: `连接${testMessage(result)}`,
+            });
+            return result.success;
+          } catch (e) {
+            setProviderTestResult(provider.id, { success: false, message: String(e) });
+            return false;
+          }
+        }),
+      );
+      const passed = outcomes.filter(Boolean).length;
 
       setBatchResult({
         success: passed === providers.length,

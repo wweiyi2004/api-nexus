@@ -19,7 +19,8 @@ fn main() {
     let state = Arc::new(AppState {
         config: Arc::new(RwLock::new(app_config)),
         client: Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap(),
         token_stats: Arc::new(RwLock::new(proxy::TokenStats::default())),
