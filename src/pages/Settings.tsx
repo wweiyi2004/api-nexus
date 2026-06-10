@@ -37,7 +37,8 @@ export default function Settings() {
     if (!config) return;
     try {
       setError(null);
-      await invoke("save_config_cmd", { config });
+      const updated = await invoke<AppConfig>("save_config_cmd", { config });
+      setConfig(updated);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -141,16 +142,24 @@ export default function Settings() {
           <KeyRound className="h-4 w-4 text-amber-600 dark:text-amber-300" />
           <h2 className="text-sm font-semibold">统一 API 密钥</h2>
         </div>
-        <div className="grid grid-cols-1 gap-4 p-4 lg:grid-cols-[1fr_auto]">
+        <div className="grid grid-cols-1 gap-4 p-4 lg:grid-cols-[1fr_auto_auto]">
           <input
             className="input-field"
             type="password"
-            placeholder="设置后，Agent 只需填写这一个密钥"
+            placeholder="留空保存将自动生成随机密钥"
             value={config.proxy_api_key}
             onChange={(e) => setConfig({ ...config, proxy_api_key: e.target.value })}
           />
+          <button
+            className="btn-icon self-center"
+            title="复制密钥"
+            onClick={() => copy(config.proxy_api_key, "proxy-key")}
+            disabled={!config.proxy_api_key}
+          >
+            {copied === "proxy-key" ? <CheckCircle2 className="h-4 w-4" /> : <Clipboard className="h-4 w-4" />}
+          </button>
           <span className={config.proxy_api_key ? "badge badge-success self-center" : "badge badge-warning self-center"}>
-            {config.proxy_api_key ? "已启用" : "留空则不验证"}
+            {config.proxy_api_key ? "已启用" : "保存后自动生成"}
           </span>
         </div>
       </section>

@@ -35,9 +35,13 @@ pub async fn get_config(state: tauri::State<'_, Arc<AppState>>) -> Result<AppCon
 #[tauri::command]
 pub async fn save_config_cmd(
     state: tauri::State<'_, Arc<AppState>>,
-    config: AppConfig,
-) -> Result<(), String> {
+    mut config: AppConfig,
+) -> Result<AppConfig, String> {
     let state_arc: &Arc<AppState> = state.inner();
+    if config.proxy_api_key.trim().is_empty() {
+        config.proxy_api_key = config::generate_proxy_api_key();
+    }
+
     let restart_required = {
         let current = state.config.read().await;
         let running = *state.running.read().await;
@@ -47,7 +51,7 @@ pub async fn save_config_cmd(
 
     config::save_config(&config)?;
     let mut current = state.config.write().await;
-    *current = config;
+    *current = config.clone();
     drop(current);
 
     if restart_required {
@@ -55,7 +59,7 @@ pub async fn save_config_cmd(
         do_start_proxy(state_arc).await?;
     }
 
-    Ok(())
+    Ok(config)
 }
 
 #[tauri::command]

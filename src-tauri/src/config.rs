@@ -105,28 +105,41 @@ fn backup_invalid_config(path: &PathBuf) {
     }
 }
 
-pub fn load_config() -> AppConfig {
+pub fn generate_proxy_api_key() -> String {
+    format!("sk-nexus-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn read_config_or_default() -> AppConfig {
     let path = config_path();
-    if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(config) => config,
-                Err(err) => {
-                    log::error!("Failed to parse config {:?}: {}", path, err);
-                    backup_invalid_config(&path);
-                    AppConfig::default()
-                }
-            },
+    if !path.exists() {
+        return AppConfig::default();
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(config) => config,
             Err(err) => {
-                log::error!("Failed to read config {:?}: {}", path, err);
+                log::error!("Failed to parse config {:?}: {}", path, err);
+                backup_invalid_config(&path);
                 AppConfig::default()
             }
+        },
+        Err(err) => {
+            log::error!("Failed to read config {:?}: {}", path, err);
+            AppConfig::default()
         }
-    } else {
-        let config = AppConfig::default();
-        save_config(&config).ok();
-        config
     }
+}
+
+pub fn load_config() -> AppConfig {
+    let mut config = read_config_or_default();
+    // An empty key disables proxy auth entirely, which lets any local process
+    // or malicious web page use the configured upstream API keys.
+    if config.proxy_api_key.trim().is_empty() {
+        config.proxy_api_key = generate_proxy_api_key();
+    }
+    save_config(&config).ok();
+    config
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
@@ -163,5 +176,15 @@ mod tests {
         assert_eq!(config.providers[0].protocol, "openai");
         assert!(config.providers[0].enabled);
         assert_eq!(config.providers[0].priority, 0);
+    }
+
+    #[test]
+    fn generated_proxy_api_keys_are_unique_and_prefixed() {
+        let first = generate_proxy_api_key();
+        let second = generate_proxy_api_key();
+
+        assert!(first.starts_with("sk-nexus-"));
+        assert!(first.len() > "sk-nexus-".len());
+        assert_ne!(first, second);
     }
 }

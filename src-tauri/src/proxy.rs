@@ -1,7 +1,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
     Json, Router,
@@ -91,7 +91,13 @@ pub fn create_proxy_router_with_stats(
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers(Any);
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("anthropic-version"),
+            HeaderName::from_static("anthropic-beta"),
+        ]);
 
     Router::new()
         .route("/v1/chat/completions", any(proxy_handler))
@@ -109,7 +115,7 @@ async fn health_handler() -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "service": "API Nexus",
-        "version": "1.0.0"
+        "version": env!("CARGO_PKG_VERSION")
     }))
 }
 
