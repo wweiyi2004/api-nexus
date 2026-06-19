@@ -3,6 +3,8 @@
 mod commands;
 mod config;
 mod proxy;
+mod security;
+mod storage;
 
 use commands::AppState;
 use reqwest::Client;
@@ -17,6 +19,17 @@ fn main() {
 
     let app_config = config::load_config();
     let auto_start = app_config.auto_start;
+    let request_logs = Arc::new(
+        storage::RequestLogStore::open(
+            &config::database_path(),
+            app_config.max_log_entries,
+            app_config.log_retention_days,
+        )
+        .expect("failed to open request log database"),
+    );
+    let persisted_stats = request_logs
+        .initial_token_stats()
+        .expect("failed to load persisted token statistics");
 
     let state = Arc::new(AppState {
         config: Arc::new(RwLock::new(app_config)),
@@ -25,14 +38,23 @@ fn main() {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap(),
-        token_stats: Arc::new(RwLock::new(proxy::TokenStats::default())),
-        request_logs: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        token_stats: Arc::new(RwLock::new(proxy::TokenStats {
+            request_count: persisted_stats.request_count,
+            input_tokens: persisted_stats.input_tokens,
+            output_tokens: persisted_stats.output_tokens,
+            cached_tokens: persisted_stats.cache_read_tokens + persisted_stats.cache_write_tokens,
+            cache_read_tokens: persisted_stats.cache_read_tokens,
+            cache_write_tokens: persisted_stats.cache_write_tokens,
+        })),
+        request_logs,
         shutdown_tx: RwLock::new(None),
         server_task: RwLock::new(None),
         running: Arc::new(RwLock::new(false)),
     });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
@@ -45,6 +67,7 @@ fn main() {
             commands::reset_token_stats,
             commands::get_request_logs,
             commands::clear_request_logs,
+            commands::export_request_logs_csv,
             commands::start_proxy,
             commands::stop_proxy,
             commands::test_provider,

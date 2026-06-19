@@ -23,6 +23,10 @@ pub struct AppConfig {
     pub model_prices: Vec<ModelPrice>,
     #[serde(default = "default_usd_to_cny_rate")]
     pub usd_to_cny_rate: f64,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    #[serde(default = "default_max_log_entries")]
+    pub max_log_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +59,10 @@ pub struct ModelPrice {
     pub output_usd_per_million: f64,
     #[serde(default)]
     pub cached_usd_per_million: f64,
+    #[serde(default)]
+    pub cache_read_usd_per_million: f64,
+    #[serde(default)]
+    pub cache_write_usd_per_million: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +101,14 @@ fn default_usd_to_cny_rate() -> f64 {
     7.2
 }
 
+fn default_log_retention_days() -> u32 {
+    30
+}
+
+fn default_max_log_entries() -> usize {
+    10_000
+}
+
 fn default_provider_enabled() -> bool {
     true
 }
@@ -113,6 +129,8 @@ impl Default for AppConfig {
             model_aliases: Vec::new(),
             model_prices: Vec::new(),
             usd_to_cny_rate: default_usd_to_cny_rate(),
+            log_retention_days: default_log_retention_days(),
+            max_log_entries: default_max_log_entries(),
         }
     }
 }
@@ -132,12 +150,25 @@ impl Default for Provider {
     }
 }
 
-fn config_path() -> PathBuf {
+pub fn app_data_dir() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("api-nexus");
     fs::create_dir_all(&path).ok();
+    path
+}
+
+fn config_path() -> PathBuf {
+    let mut path = app_data_dir();
     path.push("config.json");
     path
+}
+
+pub fn database_path() -> PathBuf {
+    app_data_dir().join("api-nexus.sqlite3")
+}
+
+fn secrets_path() -> PathBuf {
+    app_data_dir().join("secrets.dpapi")
 }
 
 fn backup_invalid_config(path: &PathBuf) {
@@ -160,6 +191,21 @@ pub fn generate_proxy_api_key() -> String {
 pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     if config.usd_to_cny_rate <= 0.0 {
         config.usd_to_cny_rate = default_usd_to_cny_rate();
+    }
+    if config.log_retention_days == 0 {
+        config.log_retention_days = default_log_retention_days();
+    }
+    config.log_retention_days = config.log_retention_days.clamp(1, 3650);
+    if config.max_log_entries == 0 {
+        config.max_log_entries = default_max_log_entries();
+    }
+    config.max_log_entries = config.max_log_entries.clamp(100, 1_000_000);
+
+    for price in &mut config.model_prices {
+        if price.cache_read_usd_per_million <= 0.0 && price.cached_usd_per_million > 0.0 {
+            price.cache_read_usd_per_million = price.cached_usd_per_million;
+        }
+        price.cached_usd_per_million = price.cache_read_usd_per_million;
     }
 
     if config.proxy_api_keys.is_empty() {
@@ -226,15 +272,26 @@ fn read_config_or_default() -> AppConfig {
 }
 
 pub fn load_config() -> AppConfig {
-    let config = normalize_config(read_config_or_default());
+    let mut config = read_config_or_default();
+    if let Err(error) = crate::security::hydrate_config_secrets(&mut config, &secrets_path()) {
+        log::error!("Failed to load secure API keys: {}", error);
+    }
+    let config = normalize_config(config);
     save_config(&config).ok();
     config
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path();
-    let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-    fs::write(&path, content).map_err(|e| e.to_string())
+    crate::security::save_config_secrets(config, &secrets_path())?;
+    let redacted = crate::security::redacted_config(config);
+    let content = serde_json::to_string_pretty(&redacted).map_err(|e| e.to_string())?;
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, content).map_err(|e| e.to_string())?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

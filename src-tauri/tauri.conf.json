@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "API Nexus",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "identifier": "com.nexus.api",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -23,18 +23,34 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE4QjhGNjY5MjMwNUIwMTAKUldRUXNBVWphZmE0R0VScTlNdnlrc21Wd1RKdU94aUJkd3d3elpERzI1M3Y0WGpnR0xCVE1nTlIK",
+      "endpoints": [
+        "https://github.com/wweiyi2004/api-nexus/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

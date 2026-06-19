@@ -6,6 +6,7 @@ import {
   ArrowUp,
   BarChart3,
   Clock3,
+  Download,
   Gauge,
   KeyRound,
   RefreshCw,
@@ -14,7 +15,7 @@ import {
   Trash2,
 } from "lucide-react";
 
-interface RequestLogEntry {
+export interface RequestLogEntry {
   timestamp: number;
   method: string;
   path: string;
@@ -25,6 +26,8 @@ interface RequestLogEntry {
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   duration_ms: number;
   error: string | null;
 }
@@ -40,11 +43,13 @@ interface Provider {
   priority: number;
 }
 
-interface ModelPrice {
+export interface ModelPrice {
   model: string;
   input_usd_per_million: number;
   output_usd_per_million: number;
   cached_usd_per_million: number;
+  cache_read_usd_per_million: number;
+  cache_write_usd_per_million: number;
 }
 
 interface AppConfig {
@@ -152,7 +157,7 @@ function trendValueForLog(
   return log.status >= 400 || log.error ? 1 : 0;
 }
 
-function buildTrendData(
+export function buildTrendData(
   logs: RequestLogEntry[],
   timeFilter: string,
   metric: TrendMetric,
@@ -269,6 +274,35 @@ function buildTrendData(
   };
 }
 
+export function calculateLogCost(
+  log: RequestLogEntry,
+  price: ModelPrice,
+  protocol: Provider["protocol"] | undefined,
+  usdToCnyRate = 7.2,
+) {
+  const cacheReadTokens = log.cache_read_tokens ?? log.cached_tokens ?? 0;
+  const cacheWriteTokens = log.cache_write_tokens ?? 0;
+  const regularInputTokens = protocol === "openai"
+    ? Math.max(0, log.input_tokens - cacheReadTokens)
+    : log.input_tokens;
+  const usd =
+    (regularInputTokens / 1_000_000) * price.input_usd_per_million +
+    (log.output_tokens / 1_000_000) * price.output_usd_per_million +
+    (cacheReadTokens / 1_000_000) * (price.cache_read_usd_per_million ?? price.cached_usd_per_million) +
+    (cacheWriteTokens / 1_000_000) * (price.cache_write_usd_per_million ?? 0);
+  return { usd, cny: usd * usdToCnyRate };
+}
+
+export function countLogTokens(
+  log: RequestLogEntry,
+  protocol: Provider["protocol"] | undefined,
+) {
+  const separateCachedTokens = protocol === "openai"
+    ? 0
+    : (log.cache_read_tokens ?? 0) + (log.cache_write_tokens ?? 0);
+  return log.input_tokens + log.output_tokens + separateCachedTokens;
+}
+
 export default function Logs() {
   const [logs, setLogs] = useState<RequestLogEntry[]>([]);
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -281,6 +315,8 @@ export default function Logs() {
   const [trendMetric, setTrendMetric] = useState<TrendMetric>("requests");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const pageSize = 20;
 
   const fetchLogs = async () => {
@@ -293,6 +329,7 @@ export default function Logs() {
       setConfig(appConfig);
     } catch (e) {
       console.error(e);
+      setError(String(e));
     } finally {
       setLoading(false);
     }
@@ -307,10 +344,24 @@ export default function Logs() {
 
   const clearLogs = async () => {
     try {
+      setError(null);
       await invoke("clear_request_logs");
       setLogs([]);
     } catch (e) {
       console.error(e);
+      setError(String(e));
+    }
+  };
+
+  const exportLogs = async () => {
+    try {
+      setError(null);
+      const path = await invoke<string>("export_request_logs_csv");
+      setNotice(`已导出到 ${path}`);
+      setTimeout(() => setNotice(null), 5000);
+    } catch (e) {
+      console.error(e);
+      setError(String(e));
     }
   };
 
@@ -353,38 +404,28 @@ export default function Logs() {
   const costFor = (log: RequestLogEntry) => {
     const price = priceMap.get(log.model.trim().toLowerCase());
     if (!price) return null;
-    // OpenAI reports cached tokens as a subset of prompt_tokens. Anthropic
-    // reports cache tokens separately from input_tokens.
-    const inputTokens = providerProtocolMap.get(log.provider) === "openai"
-      ? Math.max(0, log.input_tokens - log.cached_tokens)
-      : log.input_tokens;
-    const usd =
-      (inputTokens / 1_000_000) * price.input_usd_per_million +
-      (log.output_tokens / 1_000_000) * price.output_usd_per_million +
-      (log.cached_tokens / 1_000_000) * price.cached_usd_per_million;
-    return {
-      usd,
-      cny: usd * (config?.usd_to_cny_rate ?? 7.2),
-    };
+    return calculateLogCost(
+      log,
+      price,
+      providerProtocolMap.get(log.provider),
+      config?.usd_to_cny_rate ?? 7.2,
+    );
   };
 
-  const tokenCountFor = (log: RequestLogEntry) => {
-    const cachedTokens = providerProtocolMap.get(log.provider) === "openai"
-      ? 0
-      : log.cached_tokens;
-    return log.input_tokens + log.output_tokens + cachedTokens;
-  };
+  const tokenCountFor = (log: RequestLogEntry) =>
+    countLogTokens(log, providerProtocolMap.get(log.provider));
 
   const totals = filteredLogs.reduce(
     (acc, log) => {
       const cost = costFor(log);
       acc.input += log.input_tokens;
       acc.output += log.output_tokens;
-      acc.cached += log.cached_tokens;
+      acc.cacheRead += log.cache_read_tokens ?? log.cached_tokens ?? 0;
+      acc.cacheWrite += log.cache_write_tokens ?? 0;
       acc.usd += cost?.usd ?? 0;
       return acc;
     },
-    { input: 0, output: 0, cached: 0, usd: 0 },
+    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0 },
   );
   const trendData = buildTrendData(filteredLogs, timeFilter, trendMetric, costFor, tokenCountFor);
   const rankingMax = Math.max(...trendData.rankings.map((item) => item.value), 1);
@@ -418,12 +459,27 @@ export default function Logs() {
             <RefreshCw className="h-4 w-4" />
             刷新
           </button>
+          <button className="btn-secondary" onClick={exportLogs} disabled={logs.length === 0}>
+            <Download className="h-4 w-4" />
+            导出 CSV
+          </button>
           <button className="btn-secondary" onClick={clearLogs} disabled={logs.length === 0}>
             <Trash2 className="h-4 w-4" />
             清空
           </button>
         </div>
       </div>
+
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+          {error}
+        </div>
+      )}
+      {notice && (
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300">
+          {notice}
+        </div>
+      )}
 
       <section className="panel p-4">
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-[1fr_repeat(4,12rem)]">
@@ -464,7 +520,7 @@ export default function Logs() {
             <option value="7d">最近 7 天</option>
           </select>
         </div>
-        <div className="mt-3 grid grid-cols-2 gap-2 text-sm lg:grid-cols-5">
+        <div className="mt-3 grid grid-cols-2 gap-2 text-sm lg:grid-cols-6">
           <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
             <div className="metric-label">Requests</div>
             <div className="mt-1 font-semibold">{filteredLogs.length}</div>
@@ -478,8 +534,12 @@ export default function Logs() {
             <div className="mt-1 font-semibold text-sky-600 dark:text-sky-300">{formatTokens(totals.output)}</div>
           </div>
           <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
-            <div className="metric-label">Cache</div>
-            <div className="mt-1 font-semibold text-violet-600 dark:text-violet-300">{formatTokens(totals.cached)}</div>
+            <div className="metric-label">Cache Read</div>
+            <div className="mt-1 font-semibold text-violet-600 dark:text-violet-300">{formatTokens(totals.cacheRead)}</div>
+          </div>
+          <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
+            <div className="metric-label">Cache Write</div>
+            <div className="mt-1 font-semibold text-fuchsia-600 dark:text-fuchsia-300">{formatTokens(totals.cacheWrite)}</div>
           </div>
           <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
             <div className="metric-label">Cost</div>
@@ -699,7 +759,8 @@ export default function Logs() {
                   <th className="px-3 py-2 text-right font-medium">耗时</th>
                   <th className="px-3 py-2 text-right font-medium">In</th>
                   <th className="px-3 py-2 text-right font-medium">Out</th>
-                  <th className="px-3 py-2 text-right font-medium">Cache</th>
+                  <th className="px-3 py-2 text-right font-medium">Cache R</th>
+                  <th className="px-3 py-2 text-right font-medium">Cache W</th>
                   <th className="px-3 py-2 text-right font-medium">费用</th>
                   <th className="px-3 py-2 font-medium">错误</th>
                 </tr>
@@ -757,9 +818,18 @@ export default function Logs() {
                       )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
-                      {log.cached_tokens > 0 ? (
+                      {(log.cache_read_tokens ?? log.cached_tokens) > 0 ? (
                         <span className="text-violet-600 dark:text-violet-300">
-                          {log.cached_tokens}
+                          {log.cache_read_tokens ?? log.cached_tokens}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
+                      {(log.cache_write_tokens ?? 0) > 0 ? (
+                        <span className="text-fuchsia-600 dark:text-fuchsia-300">
+                          {log.cache_write_tokens}
                         </span>
                       ) : (
                         "—"

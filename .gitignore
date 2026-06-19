@@ -1,6 +1,8 @@
 node_modules/
 dist/
 tmp/
+playwright-report/
+test-results/
 
 src-tauri/target/
 src-tauri/data/
@@ -14,6 +16,9 @@ src-tauri/data/
 *.bak
 *.backup
 *.backup-*
+*.key
+*.pfx
+*.p12
 
 .DS_Store
 Thumbs.db

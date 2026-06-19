@@ -49,6 +49,10 @@ pub async fn save_config_cmd(
     };
 
     config::save_config(&config)?;
+    state
+        .request_logs
+        .update_policy(config.max_log_entries, config.log_retention_days)
+        .await?;
     let mut current = state.config.write().await;
     *current = config.clone();
     drop(current);
@@ -123,6 +127,7 @@ pub async fn get_token_stats(
 
 #[tauri::command]
 pub async fn reset_token_stats(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.request_logs.mark_token_stats_reset()?;
     *state.token_stats.write().await = proxy::TokenStats::default();
     Ok(())
 }
@@ -131,14 +136,28 @@ pub async fn reset_token_stats(state: tauri::State<'_, Arc<AppState>>) -> Result
 pub async fn get_request_logs(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<proxy::RequestLogEntry>, String> {
-    let logs = state.request_logs.read().await;
-    Ok(logs.iter().rev().cloned().collect())
+    Ok(state.request_logs.list().await)
 }
 
 #[tauri::command]
 pub async fn clear_request_logs(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.request_logs.write().await.clear();
-    Ok(())
+    state.request_logs.clear().await
+}
+
+#[tauri::command]
+pub async fn export_request_logs_csv(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let directory = dirs::download_dir().unwrap_or_else(config::app_data_dir);
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let filename = format!(
+        "api-nexus-logs-{}.csv",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let path = directory.join(filename);
+    std::fs::write(&path, state.request_logs.export_csv().await)
+        .map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, String> {

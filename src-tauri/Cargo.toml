@@ -1,6 +1,6 @@
 [package]
 name = "api-nexus"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2021"
 
 [dependencies]
@@ -19,6 +19,12 @@ log = "0.4"
 env_logger = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
+rusqlite = { version = "0.40", features = ["bundled"] }
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

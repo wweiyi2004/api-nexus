@@ -14,9 +14,11 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::{AppConfig, Provider};
+pub use crate::storage::RequestLogEntry;
+use crate::storage::RequestLogStore;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const PROTOCOL_ANTHROPIC: &str = "anthropic";
@@ -26,17 +28,25 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 impl TokenUsage {
     fn is_empty(self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0 && self.cached_tokens == 0
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cached_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
     }
 
     fn absorb_max(&mut self, usage: TokenUsage) {
         self.input_tokens = self.input_tokens.max(usage.input_tokens);
         self.output_tokens = self.output_tokens.max(usage.output_tokens);
         self.cached_tokens = self.cached_tokens.max(usage.cached_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(usage.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(usage.cache_write_tokens);
     }
 }
 
@@ -46,6 +56,8 @@ pub struct TokenStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 impl TokenStats {
@@ -58,37 +70,19 @@ impl TokenStats {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cached_tokens += usage.cached_tokens;
+        self.cache_read_tokens += usage.cache_read_tokens;
+        self.cache_write_tokens += usage.cache_write_tokens;
     }
 }
 
 pub type TokenStatsState = Arc<RwLock<TokenStats>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestLogEntry {
-    pub timestamp: i64,
-    pub method: String,
-    pub path: String,
-    pub model: String,
-    pub provider: String,
-    pub api_key_name: String,
-    pub status: u16,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_tokens: u64,
-    pub duration_ms: u64,
-    pub error: Option<String>,
-}
-
-pub type RequestLogState = Arc<RwLock<std::collections::VecDeque<RequestLogEntry>>>;
-
-const MAX_LOG_ENTRIES: usize = 1000;
+pub type RequestLogState = Arc<RequestLogStore>;
 
 pub async fn push_request_log(state: &RequestLogState, entry: RequestLogEntry) {
-    let mut logs = state.write().await;
-    if logs.len() >= MAX_LOG_ENTRIES {
-        logs.pop_front();
+    if let Err(error) = state.push(entry).await {
+        log::error!("Failed to persist request log: {}", error);
     }
-    logs.push_back(entry);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -115,6 +109,8 @@ async fn log_request(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_tokens: usage.cached_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         duration_ms: started.elapsed().as_millis() as u64,
         error,
     };
@@ -144,7 +140,7 @@ pub fn create_proxy_router(config: Arc<RwLock<AppConfig>>) -> Router {
     create_proxy_router_with_stats(
         config,
         Arc::new(RwLock::new(TokenStats::default())),
-        Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap()),
     )
 }
 
@@ -169,7 +165,9 @@ pub fn create_proxy_router_with_stats(
     };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            is_loopback_origin(origin)
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             header::AUTHORIZATION,
@@ -189,6 +187,26 @@ pub fn create_proxy_router_with_stats(
         .route("/health", get(health_handler))
         .with_state(state)
         .layer(cors)
+}
+
+fn is_loopback_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    [
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "http://[::1]",
+        "https://[::1]",
+    ]
+    .iter()
+    .any(|prefix| {
+        origin
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(':'))
+    })
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -439,31 +457,23 @@ fn first_u64_field(value: &Value, field_names: &[&str]) -> u64 {
         .unwrap_or_default()
 }
 
-fn sum_cache_token_fields(value: &Value) -> u64 {
-    const CACHE_FIELDS: &[&str] = &[
-        "cached_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_tokens",
-        "cache_write_tokens",
-        "cache_read",
-        "cache_creation",
-        "cache_write",
-    ];
-
+fn sum_named_token_fields(value: &Value, field_names: &[&str]) -> u64 {
     match value {
         Value::Object(map) => map
             .iter()
             .map(|(key, nested)| {
-                let current = if CACHE_FIELDS.contains(&key.as_str()) {
+                let current = if field_names.contains(&key.as_str()) {
                     nested.as_u64().unwrap_or_default()
                 } else {
                     0
                 };
-                current + sum_cache_token_fields(nested)
+                current + sum_named_token_fields(nested, field_names)
             })
             .sum(),
-        Value::Array(items) => items.iter().map(sum_cache_token_fields).sum(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| sum_named_token_fields(item, field_names))
+            .sum(),
         _ => 0,
     }
 }
@@ -478,10 +488,31 @@ fn extract_token_usage(value: &Value) -> TokenUsage {
         })
         .unwrap_or(value);
 
+    let cache_read_tokens = sum_named_token_fields(
+        usage,
+        &[
+            "cached_tokens",
+            "cache_read_input_tokens",
+            "cache_read_tokens",
+            "cache_read",
+        ],
+    );
+    let cache_write_tokens = sum_named_token_fields(
+        usage,
+        &[
+            "cache_creation_input_tokens",
+            "cache_write_tokens",
+            "cache_creation",
+            "cache_write",
+        ],
+    );
+
     TokenUsage {
         input_tokens: first_u64_field(usage, &["prompt_tokens", "input_tokens"]),
         output_tokens: first_u64_field(usage, &["completion_tokens", "output_tokens"]),
-        cached_tokens: sum_cache_token_fields(usage),
+        cached_tokens: cache_read_tokens + cache_write_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
     }
 }
 
@@ -2253,7 +2284,9 @@ mod tests {
             TokenUsage {
                 input_tokens: 120,
                 output_tokens: 34,
-                cached_tokens: 56
+                cached_tokens: 56,
+                cache_read_tokens: 56,
+                cache_write_tokens: 0,
             }
         );
 
@@ -2270,7 +2303,9 @@ mod tests {
             TokenUsage {
                 input_tokens: 80,
                 output_tokens: 20,
-                cached_tokens: 52
+                cached_tokens: 52,
+                cache_read_tokens: 40,
+                cache_write_tokens: 12,
             }
         );
     }
@@ -2437,7 +2472,7 @@ mod tests {
         let proxy = create_proxy_router_with_stats(
             Arc::new(RwLock::new(config)),
             stats.clone(),
-            Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap()),
         );
         let (proxy_addr, proxy_task) = spawn_router(proxy).await;
 
@@ -2856,6 +2891,27 @@ mod tests {
             .headers()
             .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
 
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_rejects_non_loopback_origins() {
+        let proxy = create_proxy_router(Arc::new(RwLock::new(AppConfig::default())));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+        let response = reqwest::Client::new()
+            .request(
+                Method::OPTIONS,
+                format!("http://{}/v1/chat/completions", proxy_addr),
+            )
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .send()
+            .await
+            .unwrap();
+
+        assert!(!response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
         proxy_task.abort();
     }
 

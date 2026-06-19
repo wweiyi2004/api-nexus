@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CheckCircle2, CircleOff, Clipboard, KeyRound, Power, Save, ServerCog, Tags, Trash2, Plus } from "lucide-react";
+import { check, Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { CheckCircle2, CircleOff, Clipboard, Download, KeyRound, Power, RefreshCw, Save, ServerCog, Tags, Trash2, Plus } from "lucide-react";
 
 interface ModelAlias {
   alias: string;
@@ -19,6 +21,8 @@ interface ModelPrice {
   input_usd_per_million: number;
   output_usd_per_million: number;
   cached_usd_per_million: number;
+  cache_read_usd_per_million: number;
+  cache_write_usd_per_million: number;
 }
 
 interface AppConfig {
@@ -31,6 +35,8 @@ interface AppConfig {
   model_aliases: ModelAlias[];
   model_prices: ModelPrice[];
   usd_to_cny_rate: number;
+  log_retention_days: number;
+  max_log_entries: number;
 }
 
 const emptyAlias: ModelAlias = { alias: "", model: "" };
@@ -39,6 +45,8 @@ const emptyPrice: ModelPrice = {
   input_usd_per_million: 0,
   output_usd_per_million: 0,
   cached_usd_per_million: 0,
+  cache_read_usd_per_million: 0,
+  cache_write_usd_per_million: 0,
 };
 
 function generateProxyKey() {
@@ -52,6 +60,9 @@ export default function Settings() {
   const [copied, setCopied] = useState<string | null>(null);
   const [newAlias, setNewAlias] = useState<ModelAlias>(emptyAlias);
   const [newPrice, setNewPrice] = useState<ModelPrice>(emptyPrice);
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<string>("");
+  const [updating, setUpdating] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -88,6 +99,42 @@ export default function Settings() {
     await navigator.clipboard.writeText(value);
     setCopied(key);
     setTimeout(() => setCopied(null), 1400);
+  };
+
+  const checkForUpdates = async () => {
+    try {
+      setError(null);
+      setUpdateStatus("正在检查更新…");
+      const update = await check({ timeout: 30000 });
+      setAvailableUpdate(update);
+      setUpdateStatus(update ? `发现新版本 ${update.version}` : "当前已是最新版本");
+    } catch (e) {
+      console.error(e);
+      setUpdateStatus("");
+      setError(`检查更新失败：${String(e)}`);
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!availableUpdate) return;
+    try {
+      setError(null);
+      setUpdating(true);
+      let downloaded = 0;
+      let total = 0;
+      await availableUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") total = event.data.contentLength ?? 0;
+        if (event.event === "Progress") downloaded += event.data.chunkLength;
+        if (event.event === "Finished") setUpdateStatus("安装完成，正在重启…");
+        else if (total > 0) setUpdateStatus(`正在下载 ${Math.round((downloaded / total) * 100)}%`);
+        else setUpdateStatus("正在下载更新…");
+      });
+      await relaunch();
+    } catch (e) {
+      console.error(e);
+      setError(`安装更新失败：${String(e)}`);
+      setUpdating(false);
+    }
   };
 
   if (!config) {
@@ -173,6 +220,73 @@ export default function Settings() {
           </div>
         </div>
       </section>
+
+      <section className="panel">
+        <div className="flex items-center gap-2 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
+          <ServerCog className="h-4 w-4 text-violet-600 dark:text-violet-300" />
+          <h2 className="text-sm font-semibold">日志持久化</h2>
+        </div>
+        <div className="grid grid-cols-1 gap-4 p-4 md:grid-cols-2">
+          <label className="space-y-1.5">
+            <span className="text-sm font-medium text-surface-700 dark:text-surface-300">保留天数</span>
+            <input
+              className="input-field"
+              type="number"
+              min={1}
+              max={3650}
+              value={config.log_retention_days}
+              onChange={(e) => setConfig({ ...config, log_retention_days: parseInt(e.target.value, 10) || 30 })}
+            />
+          </label>
+          <label className="space-y-1.5">
+            <span className="text-sm font-medium text-surface-700 dark:text-surface-300">最多记录数</span>
+            <input
+              className="input-field"
+              type="number"
+              min={100}
+              max={1000000}
+              value={config.max_log_entries}
+              onChange={(e) => setConfig({ ...config, max_log_entries: parseInt(e.target.value, 10) || 10000 })}
+            />
+          </label>
+          <p className="text-xs text-surface-500 dark:text-surface-400 md:col-span-2">
+            请求日志保存在本机 SQLite 数据库；API 密钥使用当前 Windows 用户的 DPAPI 加密后单独保存。
+          </p>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="flex items-center gap-2 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
+          <RefreshCw className="h-4 w-4 text-cyan-600 dark:text-cyan-300" />
+          <h2 className="text-sm font-semibold">应用更新</h2>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 p-4">
+          <div>
+            <p className="text-sm text-surface-700 dark:text-surface-200">{updateStatus || "从 GitHub Release 检查签名更新"}</p>
+            {availableUpdate?.body && (
+              <p className="mt-1 max-w-2xl whitespace-pre-wrap text-xs text-surface-500 dark:text-surface-400">{availableUpdate.body}</p>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button className="btn-secondary" onClick={checkForUpdates} disabled={updating}>
+              <RefreshCw className="h-4 w-4" />
+              检查更新
+            </button>
+            {availableUpdate && (
+              <button className="btn-primary" onClick={installUpdate} disabled={updating}>
+                <Download className="h-4 w-4" />
+                {updating ? "正在安装" : `安装 ${availableUpdate.version}`}
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {!(["127.0.0.1", "localhost", "::1"].includes(config.proxy_host.trim().toLowerCase())) && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300">
+          当前监听地址可能暴露到局域网。请确保客户端密钥已启用，并通过防火墙限制访问范围。
+        </div>
+      )}
 
       <section className="panel">
         <div className="flex items-center justify-between gap-3 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
@@ -380,7 +494,7 @@ export default function Settings() {
         </div>
         <div className="space-y-2 p-4">
           {config.model_prices.map((price, index) => (
-            <div key={`${price.model}-${index}`} className="grid grid-cols-1 gap-2 lg:grid-cols-[1fr_repeat(3,9rem)_auto]">
+            <div key={`${price.model}-${index}`} className="grid grid-cols-1 gap-2 lg:grid-cols-[1fr_repeat(4,8rem)_auto]">
               <input
                 className="input-field"
                 placeholder="模型名"
@@ -422,11 +536,25 @@ export default function Settings() {
                 type="number"
                 min="0"
                 step="0.0001"
-                placeholder="Cache"
-                value={price.cached_usd_per_million}
+                placeholder="Cache Read"
+                value={price.cache_read_usd_per_million}
                 onChange={(e) => {
                   const next = [...config.model_prices];
-                  next[index] = { ...price, cached_usd_per_million: parseFloat(e.target.value) || 0 };
+                  const value = parseFloat(e.target.value) || 0;
+                  next[index] = { ...price, cache_read_usd_per_million: value, cached_usd_per_million: value };
+                  setConfig({ ...config, model_prices: next });
+                }}
+              />
+              <input
+                className="input-field"
+                type="number"
+                min="0"
+                step="0.0001"
+                placeholder="Cache Write"
+                value={price.cache_write_usd_per_million}
+                onChange={(e) => {
+                  const next = [...config.model_prices];
+                  next[index] = { ...price, cache_write_usd_per_million: parseFloat(e.target.value) || 0 };
                   setConfig({ ...config, model_prices: next });
                 }}
               />
@@ -447,7 +575,7 @@ export default function Settings() {
               暂无价格。添加后请求日志会自动计算每条请求费用。
             </div>
           )}
-          <div className="grid grid-cols-1 gap-2 pt-2 lg:grid-cols-[1fr_repeat(3,9rem)_auto]">
+          <div className="grid grid-cols-1 gap-2 pt-2 lg:grid-cols-[1fr_repeat(4,8rem)_auto]">
             <input
               className="input-field"
               placeholder="模型名"
@@ -477,9 +605,21 @@ export default function Settings() {
               type="number"
               min="0"
               step="0.0001"
-              placeholder="Cache"
-              value={newPrice.cached_usd_per_million}
-              onChange={(e) => setNewPrice({ ...newPrice, cached_usd_per_million: parseFloat(e.target.value) || 0 })}
+              placeholder="Cache Read"
+              value={newPrice.cache_read_usd_per_million}
+              onChange={(e) => {
+                const value = parseFloat(e.target.value) || 0;
+                setNewPrice({ ...newPrice, cache_read_usd_per_million: value, cached_usd_per_million: value });
+              }}
+            />
+            <input
+              className="input-field"
+              type="number"
+              min="0"
+              step="0.0001"
+              placeholder="Cache Write"
+              value={newPrice.cache_write_usd_per_million}
+              onChange={(e) => setNewPrice({ ...newPrice, cache_write_usd_per_million: parseFloat(e.target.value) || 0 })}
             />
             <button
               className="btn-secondary"
