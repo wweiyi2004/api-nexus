@@ -2,7 +2,7 @@ use crate::config::{self, AppConfig, Provider};
 use crate::proxy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, RwLock};
@@ -321,4 +321,224 @@ pub async fn test_provider(
         "body": body,
         "success": (200..300).contains(&status)
     }))
+}
+
+fn model_id_from_value(value: &Value) -> Option<String> {
+    if let Some(model) = value.as_str() {
+        return Some(model.to_string());
+    }
+
+    ["id", "name", "model"]
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn extract_model_ids(body: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+
+    for key in ["data", "models", "items"] {
+        if let Some(items) = body.get(key).and_then(Value::as_array) {
+            models.extend(items.iter().filter_map(model_id_from_value));
+        }
+    }
+
+    if let Some(items) = body.as_array() {
+        models.extend(items.iter().filter_map(model_id_from_value));
+    }
+
+    models.sort();
+    models.dedup();
+    models
+}
+
+#[tauri::command]
+pub async fn fetch_provider_models(
+    state: tauri::State<'_, Arc<AppState>>,
+    provider: Provider,
+) -> Result<Vec<String>, String> {
+    fetch_provider_models_with_client(&state.client, provider).await
+}
+
+async fn fetch_provider_models_with_client(
+    client: &Client,
+    provider: Provider,
+) -> Result<Vec<String>, String> {
+    if provider.base_url.trim().is_empty() {
+        return Err("Base URL is required".to_string());
+    }
+
+    let protocol = provider.protocol.to_ascii_lowercase();
+    let is_anthropic = protocol == "anthropic";
+    let url = if is_anthropic {
+        proxy::anthropic_upstream_url(&provider.base_url, "/v1/models")
+    } else {
+        proxy::openai_upstream_url(&provider.base_url, "/v1/models")
+    };
+
+    let mut req = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(20));
+
+    if !provider.api_key.trim().is_empty() {
+        if is_anthropic {
+            req = req
+                .header("x-api-key", provider.api_key)
+                .header("anthropic-version", "2023-06-01");
+        } else {
+            req = req.header("Authorization", format!("Bearer {}", provider.api_key));
+        }
+    } else if is_anthropic {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch models: {}", e))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Failed to fetch models: HTTP {} - {}",
+            status.as_u16(),
+            text
+        ));
+    }
+
+    let body: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse model list response: {}", e))?;
+    let models = extract_model_ids(&body);
+    if models.is_empty() {
+        return Err("No models found in response".to_string());
+    }
+
+    Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        http::{header, HeaderMap},
+        response::IntoResponse,
+        routing::get,
+        Json, Router,
+    };
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    async fn spawn_router(router: Router) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn model_ids_are_extracted_from_common_response_shapes() {
+        let openai_body = json!({
+            "data": [
+                {"id": "gpt-4o"},
+                {"id": "gpt-4o-mini"}
+            ]
+        });
+        assert_eq!(
+            extract_model_ids(&openai_body),
+            vec!["gpt-4o", "gpt-4o-mini"]
+        );
+
+        let alternate_body = json!({
+            "models": [
+                "deepseek-chat",
+                {"name": "deepseek-reasoner"}
+            ]
+        });
+        assert_eq!(
+            extract_model_ids(&alternate_body),
+            vec!["deepseek-chat", "deepseek-reasoner"]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_models_are_fetched_from_openai_compatible_endpoint() {
+        let upstream = Router::new().route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer upstream-key")
+                );
+
+                Json(json!({
+                    "data": [
+                        {"id": "model-b"},
+                        {"id": "model-a"}
+                    ]
+                }))
+                .into_response()
+            }),
+        );
+        let (addr, task) = spawn_router(upstream).await;
+        let provider = Provider {
+            protocol: "openai".to_string(),
+            base_url: format!("http://{}", addr),
+            api_key: "upstream-key".to_string(),
+            ..Default::default()
+        };
+
+        let models = fetch_provider_models_with_client(&Client::new(), provider)
+            .await
+            .unwrap();
+
+        assert_eq!(models, vec!["model-a", "model-b"]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_models_are_fetched_from_anthropic_compatible_endpoint() {
+        let upstream = Router::new().route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers.get("x-api-key").and_then(|value| value.to_str().ok()),
+                    Some("anthropic-key")
+                );
+                assert_eq!(
+                    headers
+                        .get("anthropic-version")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("2023-06-01")
+                );
+
+                Json(json!({
+                    "data": [
+                        {"id": "claude-sonnet-4"},
+                        {"id": "claude-opus-4"}
+                    ]
+                }))
+                .into_response()
+            }),
+        );
+        let (addr, task) = spawn_router(upstream).await;
+        let provider = Provider {
+            protocol: "anthropic".to_string(),
+            base_url: format!("http://{}", addr),
+            api_key: "anthropic-key".to_string(),
+            ..Default::default()
+        };
+
+        let models = fetch_provider_models_with_client(&Client::new(), provider)
+            .await
+            .unwrap();
+
+        assert_eq!(models, vec!["claude-opus-4", "claude-sonnet-4"]);
+        task.abort();
+    }
 }

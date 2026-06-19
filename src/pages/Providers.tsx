@@ -9,6 +9,7 @@ import {
   Network,
   Pencil,
   Plus,
+  RefreshCw,
   Save,
   Trash2,
   X,
@@ -217,6 +218,8 @@ export default function Providers() {
   const [testing, setTesting] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, ProviderTestResult>>({});
   const [batchResult, setBatchResult] = useState<ProviderTestResult | null>(null);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelFetchResult, setModelFetchResult] = useState<ProviderTestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fetchConfig = async () => {
@@ -236,12 +239,14 @@ export default function Providers() {
   const beginCreate = () => {
     setEditing({ ...emptyProvider });
     setModelInput("");
+    setModelFetchResult(null);
     setShowForm(true);
   };
 
   const beginEdit = (provider: Provider) => {
     setEditing({ ...provider });
     setModelInput("");
+    setModelFetchResult(null);
     setShowForm(true);
   };
 
@@ -257,6 +262,7 @@ export default function Providers() {
       models: preset.models,
     });
     setModelInput("");
+    setModelFetchResult(null);
   };
 
   const handleSave = async () => {
@@ -408,6 +414,37 @@ export default function Providers() {
       });
     } finally {
       setTesting(null);
+    }
+  };
+
+  const handleFetchModels = async () => {
+    if (!editing) return;
+    if (!editing.base_url.trim()) {
+      setModelFetchResult({ success: false, message: "请先填写基础地址" });
+      return;
+    }
+
+    setFetchingModels(true);
+    setModelFetchResult(null);
+    try {
+      setError(null);
+      const models = await invoke<string[]>("fetch_provider_models", { provider: editing });
+      setEditing((current) =>
+        current
+          ? {
+              ...current,
+              models: Array.from(new Set([...current.models, ...models])),
+            }
+          : current,
+      );
+      setModelFetchResult({
+        success: true,
+        message: `已获取 ${models.length} 个模型`,
+      });
+    } catch (e) {
+      setModelFetchResult({ success: false, message: String(e) });
+    } finally {
+      setFetchingModels(false);
     }
   };
 
@@ -581,7 +618,17 @@ export default function Providers() {
             </label>
 
             <div className="space-y-2 lg:col-span-4">
-              <span className="text-sm font-medium text-surface-700 dark:text-surface-300">模型</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium text-surface-700 dark:text-surface-300">模型</span>
+                {modelFetchResult && (
+                  <span
+                    className={`badge max-w-full truncate ${modelFetchResult.success ? "badge-success" : "badge-error"}`}
+                    title={modelFetchResult.message}
+                  >
+                    {modelFetchResult.message}
+                  </span>
+                )}
+              </div>
               <div className="flex gap-2">
                 <input
                   className="input-field"
@@ -597,6 +644,18 @@ export default function Providers() {
                 <button className="btn-secondary shrink-0" onClick={addModel}>
                   <Plus className="h-4 w-4" />
                   添加
+                </button>
+                <button
+                  className="btn-secondary shrink-0"
+                  onClick={handleFetchModels}
+                  disabled={fetchingModels || !editing.base_url.trim()}
+                >
+                  {fetchingModels ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
+                  {fetchingModels ? "获取中" : "获取模型"}
                 </button>
               </div>
               {editing.models.length > 0 && (

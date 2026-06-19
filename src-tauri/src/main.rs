@@ -48,6 +48,7 @@ fn main() {
             commands::start_proxy,
             commands::stop_proxy,
             commands::test_provider,
+            commands::fetch_provider_models,
         ])
         .setup(move |app| {
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
