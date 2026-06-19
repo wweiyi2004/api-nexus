@@ -746,114 +746,100 @@ export default function Logs() {
         </div>
       ) : (
         <section className="panel overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-surface-200 text-left text-xs uppercase tracking-wide text-surface-500 dark:border-surface-800 dark:text-surface-400">
-                  <th className="px-3 py-2 font-medium">时间</th>
-                  <th className="px-3 py-2 font-medium">路径</th>
-                  <th className="px-3 py-2 font-medium">模型</th>
-                  <th className="px-3 py-2 font-medium">服务商</th>
-                  <th className="px-3 py-2 font-medium">密钥</th>
-                  <th className="px-3 py-2 font-medium">状态</th>
-                  <th className="px-3 py-2 text-right font-medium">耗时</th>
-                  <th className="px-3 py-2 text-right font-medium">In</th>
-                  <th className="px-3 py-2 text-right font-medium">Out</th>
-                  <th className="px-3 py-2 text-right font-medium">Cache R</th>
-                  <th className="px-3 py-2 text-right font-medium">Cache W</th>
-                  <th className="px-3 py-2 text-right font-medium">费用</th>
-                  <th className="px-3 py-2 font-medium">错误</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pagedLogs.map((log, index) => {
-                  const cost = costFor(log);
-                  return (
-                  <tr
-                    key={index}
-                    className="border-b border-surface-100 text-surface-700 last:border-0 hover:bg-surface-50 dark:border-surface-800/60 dark:text-surface-200 dark:hover:bg-surface-950"
-                  >
-                    <td className="whitespace-nowrap px-3 py-2 font-mono text-xs text-surface-500 dark:text-surface-400">
+          <div className="divide-y divide-surface-100 dark:divide-surface-800/60">
+            {pagedLogs.map((log, index) => {
+              const cost = costFor(log);
+              return (
+                <article
+                  key={`${log.timestamp}-${log.path}-${index}`}
+                  className="px-4 py-4 text-sm text-surface-700 transition-colors hover:bg-surface-50 dark:text-surface-200 dark:hover:bg-surface-950"
+                >
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                    <span className={`badge ${statusClass(log.status)}`}>{log.status}</span>
+                    <time className="font-mono text-xs text-surface-500 dark:text-surface-400">
                       {formatTime(log.timestamp)}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 font-mono text-xs text-surface-500">
-                      {log.path}
-                    </td>
-                    <td className="max-w-[16rem] truncate px-3 py-2" title={log.model}>
-                      {log.model || "—"}
-                    </td>
-                    <td className="max-w-[10rem] truncate px-3 py-2" title={log.provider}>
-                      {log.provider || "—"}
-                    </td>
-                    <td className="max-w-[10rem] truncate px-3 py-2" title={log.api_key_name}>
-                      <span className="inline-flex items-center gap-1">
-                        <KeyRound className="h-3 w-3 text-surface-400" />
-                        {log.api_key_name || "—"}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2">
-                      <span className={`badge ${statusClass(log.status)}`}>{log.status}</span>
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
+                    </time>
+                    <span className="min-w-0 break-all font-mono text-xs text-surface-600 dark:text-surface-300">
+                      {log.method} {log.path}
+                    </span>
+                    <span className="ml-auto whitespace-nowrap font-mono text-xs text-surface-500">
                       {log.duration_ms}ms
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
-                      {log.input_tokens > 0 ? (
-                        <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-300">
-                          <ArrowDown className="h-3 w-3" />
-                          {log.input_tokens}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
-                      {log.output_tokens > 0 ? (
-                        <span className="inline-flex items-center gap-1 text-sky-600 dark:text-sky-300">
-                          <ArrowUp className="h-3 w-3" />
-                          {log.output_tokens}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
-                      {(log.cache_read_tokens ?? log.cached_tokens) > 0 ? (
-                        <span className="text-violet-600 dark:text-violet-300">
-                          {log.cache_read_tokens ?? log.cached_tokens}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
-                      {(log.cache_write_tokens ?? 0) > 0 ? (
-                        <span className="text-fuchsia-600 dark:text-fuchsia-300">
-                          {log.cache_write_tokens}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs">
-                      {cost ? (
-                        <span title={`${formatMoney(cost.usd, "$")} / ${formatMoney(cost.cny, "¥")}`}>
-                          {formatMoney(cost.usd, "$")}
-                          <span className="ml-1 text-surface-400">/</span>
-                          <span className="ml-1">{formatMoney(cost.cny, "¥")}</span>
-                        </span>
-                      ) : (
-                        <span className="text-surface-400">未配置</span>
-                      )}
-                    </td>
-                    <td className="max-w-[20rem] truncate px-3 py-2 text-xs text-red-600 dark:text-red-400" title={log.error ?? ""}>
-                      {log.error ?? ""}
-                    </td>
-                  </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                    </span>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <div className="min-w-0 rounded-md bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                      <div className="metric-label">模型</div>
+                      <div className="mt-1 break-all font-medium">{log.model || "—"}</div>
+                    </div>
+                    <div className="min-w-0 rounded-md bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                      <div className="metric-label">服务商</div>
+                      <div className="mt-1 break-all font-medium">{log.provider || "—"}</div>
+                    </div>
+                    <div className="min-w-0 rounded-md bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                      <div className="metric-label">密钥</div>
+                      <div className="mt-1 flex min-w-0 items-center gap-1 font-medium">
+                        <KeyRound className="h-3 w-3 shrink-0 text-surface-400" />
+                        <span className="break-all">{log.api_key_name || "—"}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
+                      <div className="metric-label">Input</div>
+                      <div className="mt-1 inline-flex items-center gap-1 font-mono text-xs text-emerald-600 dark:text-emerald-300">
+                        <ArrowDown className="h-3 w-3" />
+                        {log.input_tokens > 0 ? formatTokens(log.input_tokens) : "—"}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
+                      <div className="metric-label">Output</div>
+                      <div className="mt-1 inline-flex items-center gap-1 font-mono text-xs text-sky-600 dark:text-sky-300">
+                        <ArrowUp className="h-3 w-3" />
+                        {log.output_tokens > 0 ? formatTokens(log.output_tokens) : "—"}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
+                      <div className="metric-label">Cache Read</div>
+                      <div className="mt-1 font-mono text-xs text-violet-600 dark:text-violet-300">
+                        {(log.cache_read_tokens ?? log.cached_tokens) > 0
+                          ? formatTokens(log.cache_read_tokens ?? log.cached_tokens)
+                          : "—"}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
+                      <div className="metric-label">Cache Write</div>
+                      <div className="mt-1 font-mono text-xs text-fuchsia-600 dark:text-fuchsia-300">
+                        {(log.cache_write_tokens ?? 0) > 0
+                          ? formatTokens(log.cache_write_tokens)
+                          : "—"}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800 sm:col-span-2 xl:col-span-2">
+                      <div className="metric-label">费用</div>
+                      <div className="mt-1 font-mono text-xs">
+                        {cost ? (
+                          <>
+                            {formatMoney(cost.usd, "$")}
+                            <span className="mx-1 text-surface-400">/</span>
+                            {formatMoney(cost.cny, "¥")}
+                          </>
+                        ) : (
+                          <span className="text-surface-400">未配置</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {log.error && (
+                    <div className="mt-2 break-words rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+                      {log.error}
+                    </div>
+                  )}
+                </article>
+              );
+            })}
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-surface-200 px-4 py-3 text-sm dark:border-surface-800">
             <span className="text-surface-500 dark:text-surface-400">

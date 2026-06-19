@@ -2,8 +2,39 @@ import { expect, test } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
-    const config = {
-      providers: [],
+    let config = {
+      providers: [
+        {
+          id: "provider-a",
+          name: "OpenAI Route",
+          protocol: "openai",
+          base_url: "https://a.example.com",
+          api_key: "",
+          models: ["shared-model"],
+          enabled: true,
+          priority: 0,
+        },
+        {
+          id: "provider-b",
+          name: "Other Route",
+          protocol: "openai",
+          base_url: "https://b.example.com",
+          api_key: "",
+          models: ["other-model"],
+          enabled: true,
+          priority: 1,
+        },
+        {
+          id: "provider-c",
+          name: "Anthropic Route",
+          protocol: "anthropic",
+          base_url: "https://c.example.com",
+          api_key: "",
+          models: ["shared-model"],
+          enabled: true,
+          priority: 2,
+        },
+      ],
       proxy_port: 11434,
       proxy_host: "127.0.0.1",
       auto_start: true,
@@ -16,11 +47,15 @@ test.beforeEach(async ({ page }) => {
       max_log_entries: 10000,
     };
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-      invoke: async (command: string) => {
+      invoke: async (command: string, args?: { config?: typeof config }) => {
         if (command === "get_server_status") {
           return { running: false, port: 11434, host: "127.0.0.1", url: "http://127.0.0.1:11434" };
         }
-        if (command === "get_config" || command === "save_config_cmd") return config;
+        if (command === "get_config") return config;
+        if (command === "save_config_cmd") {
+          config = args?.config ?? config;
+          return config;
+        }
         if (command === "get_token_stats") {
           return {
             request_count: 0,
@@ -50,4 +85,19 @@ test("navigates through dashboard, logs and settings", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "设置" })).toBeVisible();
   await expect(page.getByText("日志持久化")).toBeVisible();
   await expect(page.getByText("应用更新")).toBeVisible();
+});
+
+test("reorders model routes by dragging and saves provider priority", async ({ page }) => {
+  await page.goto("/models");
+  await expect(page.getByRole("heading", { name: "模型路由" })).toBeVisible();
+
+  const sharedModel = page.locator(".data-row").filter({ hasText: "shared-model" });
+  const routes = sharedModel.getByTestId("provider-route");
+  await expect(routes).toHaveCount(2);
+  await expect(routes.nth(0)).toContainText("OpenAI Route");
+
+  await routes.nth(1).dragTo(routes.nth(0));
+
+  await expect(sharedModel.getByTestId("provider-route").nth(0)).toContainText("Anthropic Route");
+  await expect(sharedModel.getByText("正在保存")).toHaveCount(0);
 });

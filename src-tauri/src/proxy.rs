@@ -326,24 +326,6 @@ fn base_url_has_path(base_url: &str) -> bool {
     without_scheme.contains('/')
 }
 
-fn base_url_ends_with_version_segment(base_url: &str) -> bool {
-    let Some(segment) = base_url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|segment| !segment.is_empty())
-    else {
-        return false;
-    };
-
-    let lower = segment.to_ascii_lowercase();
-    lower == "v1"
-        || lower == "v1beta"
-        || lower == "v3"
-        || lower == "v4"
-        || lower.chars().all(|ch| ch.is_ascii_digit())
-}
-
 fn strip_standard_v1_prefix(path: &str) -> &str {
     let trimmed = path.trim_start_matches('/');
     trimmed.strip_prefix("v1/").unwrap_or(trimmed)
@@ -382,7 +364,7 @@ pub(crate) fn anthropic_upstream_url(base_url: &str, path: &str) -> String {
         return base.to_string();
     }
 
-    if base_url_ends_with_version_segment(base) {
+    if base_url_has_path(base) {
         join_upstream_url(base, without_v1)
     } else {
         join_upstream_url(base, requested)
@@ -2362,7 +2344,7 @@ mod tests {
         );
         assert_eq!(
             anthropic_upstream_url("https://api.deepseek.com/anthropic", "/v1/messages"),
-            "https://api.deepseek.com/anthropic/v1/messages"
+            "https://api.deepseek.com/anthropic/messages"
         );
         assert_eq!(
             anthropic_upstream_url("https://api.example.com/anthropic/v1", "/v1/messages"),
