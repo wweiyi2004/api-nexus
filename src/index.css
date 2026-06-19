@@ -115,3 +115,19 @@ body {
   50% { background-position: 100% 50%; }
   100% { background-position: 0% 50%; }
 }
+
+@keyframes running-bar {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(360%); }
+}
+
+@keyframes running-wave {
+  0%, 100% {
+    transform: scaleY(0.45);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}

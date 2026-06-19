@@ -374,9 +374,7 @@ async fn fetch_provider_models_with_client(
         proxy::openai_upstream_url(&provider.base_url, "/v1/models")
     };
 
-    let mut req = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(20));
+    let mut req = client.get(&url).timeout(std::time::Duration::from_secs(20));
 
     if !provider.api_key.trim().is_empty() {
         if is_anthropic {
@@ -505,7 +503,9 @@ mod tests {
             "/v1/models",
             get(|headers: HeaderMap| async move {
                 assert_eq!(
-                    headers.get("x-api-key").and_then(|value| value.to_str().ok()),
+                    headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok()),
                     Some("anthropic-key")
                 );
                 assert_eq!(

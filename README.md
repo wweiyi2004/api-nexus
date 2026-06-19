@@ -9,7 +9,9 @@ API Nexus is a local API gateway for routing AI model requests through OpenAI-co
 - Bidirectional protocol conversion between OpenAI chat completions and Anthropic messages
 - Provider priority routing and fallback
 - Provider presets for common model vendors
-- Local proxy API key protection
+- Multiple named client API keys with per-key request attribution
+- Request logs, token usage trends, and configurable USD/CNY cost estimates
+- Local proxy API key protection and background system-tray operation
 - Tauri desktop UI with responsive provider and model management pages
 
 ## Local Development

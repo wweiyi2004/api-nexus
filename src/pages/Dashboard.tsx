@@ -75,6 +75,23 @@ function formatTokens(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
+function RunningWave({ active }: { active: boolean }) {
+  return (
+    <div
+      className={`flex h-7 items-end gap-1 ${active ? "text-emerald-500 dark:text-emerald-300" : "text-surface-300 dark:text-surface-700"}`}
+      aria-hidden="true"
+    >
+      {[14, 22, 18, 26, 16].map((height, index) => (
+        <span
+          key={index}
+          className={`w-1.5 origin-bottom rounded-full bg-current ${active ? "animate-[running-wave_1.1s_ease-in-out_infinite]" : ""}`}
+          style={{ height, animationDelay: `${index * 120}ms` }}
+        />
+      ))}
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [status, setStatus] = useState<ServerStatus | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -208,23 +225,57 @@ export default function Dashboard() {
       </div>
 
       <section className="grid grid-cols-1 gap-3 md:grid-cols-4">
-        <div className="panel p-4">
+        <div
+          className={`panel relative overflow-hidden p-4 ${
+            status?.running
+              ? "border-emerald-200 dark:border-emerald-500/40"
+              : ""
+          }`}
+        >
+          {status?.running && (
+            <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-emerald-100 dark:bg-emerald-500/10">
+              <div className="h-full w-1/3 animate-[running-bar_1.6s_ease-in-out_infinite] bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
+            </div>
+          )}
           <div className="flex items-center justify-between">
             <div>
               <div className="metric-label">Status</div>
-              <div className="mt-2 text-xl font-semibold">
-                {status?.running ? "运行中" : "已停止"}
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <span className="text-xl font-semibold">
+                  {status?.running ? "运行中" : "已停止"}
+                </span>
+                {status?.running && (
+                  <span className="badge badge-success">
+                    <span className="relative flex h-2 w-2">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                    </span>
+                    Live
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 text-xs text-surface-500 dark:text-surface-400">
+                {status?.running ? `正在监听 ${baseUrl}` : "代理服务未启动"}
               </div>
             </div>
             <div
-              className={`flex h-10 w-10 items-center justify-center rounded-lg ${
+              className={`relative flex h-11 w-11 items-center justify-center rounded-lg ${
                 status?.running
                   ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
                   : "bg-surface-100 text-surface-500 dark:bg-surface-800 dark:text-surface-400"
               }`}
             >
+              {status?.running && (
+                <span className="absolute inset-0 rounded-lg bg-emerald-400/30 animate-ping" />
+              )}
               <Activity className="h-5 w-5" />
             </div>
+          </div>
+          <div className="mt-4 flex items-end justify-between gap-3">
+            <RunningWave active={Boolean(status?.running)} />
+            <span className="font-mono text-[11px] text-surface-500 dark:text-surface-400">
+              {status?.running ? "accepting requests" : "idle"}
+            </span>
           </div>
         </div>
         <div className="panel p-4">
@@ -363,6 +414,12 @@ export default function Dashboard() {
             <h2 className="text-sm font-semibold">入口地址</h2>
           </div>
           <span className={status?.running ? "badge badge-success" : "badge badge-neutral"}>
+            {status?.running && (
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+              </span>
+            )}
             {status?.running ? "Listening" : "Offline"}
           </span>
         </div>

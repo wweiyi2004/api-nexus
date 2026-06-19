@@ -1,6 +1,18 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Activity, ArrowDown, ArrowUp, KeyRound, RefreshCw, ScrollText, Search, Trash2 } from "lucide-react";
+import {
+  Activity,
+  ArrowDown,
+  ArrowUp,
+  BarChart3,
+  Clock3,
+  Gauge,
+  KeyRound,
+  RefreshCw,
+  ScrollText,
+  Search,
+  Trash2,
+} from "lucide-react";
 
 interface RequestLogEntry {
   timestamp: number;
@@ -41,10 +53,43 @@ interface AppConfig {
   usd_to_cny_rate: number;
 }
 
+type TrendMetric = "requests" | "tokens" | "cost" | "errors";
+
+interface TrendBucket {
+  label: string;
+  rangeLabel: string;
+  total: number;
+  values: Map<string, number>;
+}
+
+interface TrendRanking {
+  name: string;
+  value: number;
+  requests: number;
+  errors: number;
+  lastTs: number;
+}
+
+interface TrendSeries {
+  name: string;
+  color: string;
+  value: number;
+}
+
+const trendMetricLabels: Record<TrendMetric, string> = {
+  requests: "请求数",
+  tokens: "Token",
+  cost: "费用",
+  errors: "错误",
+};
+
+const trendColors = ["#0891b2", "#10b981", "#6366f1", "#f59e0b", "#ef4444", "#64748b"];
+const unverifiedKeyFilter = "__api_nexus_unverified__";
+
 function formatTime(ts: number) {
   const d = new Date(ts * 1000);
   const pad = (n: number) => n.toString().padStart(2, "0");
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function formatTokens(value: number) {
@@ -56,10 +101,172 @@ function formatMoney(value: number, symbol: string) {
   return `${symbol}${value < 0.01 ? value.toFixed(6) : value.toFixed(4)}`;
 }
 
+function formatTrendValue(value: number, metric: TrendMetric, compact = false) {
+  if (metric === "cost") return formatMoney(value, "$");
+  const formatter = new Intl.NumberFormat("en-US", {
+    notation: compact ? "compact" : "standard",
+    maximumFractionDigits: metric === "tokens" && compact ? 1 : 0,
+  });
+  return formatter.format(Math.round(value));
+}
+
+function formatBucketLabel(ts: number, spanSeconds: number) {
+  const d = new Date(ts * 1000);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  if (spanSeconds <= 24 * 3600) {
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  if (spanSeconds <= 7 * 86400) {
+    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:00`;
+  }
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function formatRelativeTime(ts: number) {
+  const diff = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (diff < 60) return `${Math.max(1, diff)} 秒前`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  return `${Math.floor(diff / 86400)} 天前`;
+}
+
 function statusClass(status: number) {
   if (status >= 200 && status < 300) return "badge-success";
   if (status >= 400 && status < 500) return "badge-warning";
   return "badge-error";
+}
+
+function logKeyName(log: RequestLogEntry) {
+  return log.api_key_name || "未验证";
+}
+
+function trendValueForLog(
+  log: RequestLogEntry,
+  metric: TrendMetric,
+  costFor: (log: RequestLogEntry) => { usd: number; cny: number } | null,
+  tokenCountFor: (log: RequestLogEntry) => number,
+) {
+  if (metric === "requests") return 1;
+  if (metric === "tokens") return tokenCountFor(log);
+  if (metric === "cost") return costFor(log)?.usd ?? 0;
+  return log.status >= 400 || log.error ? 1 : 0;
+}
+
+function buildTrendData(
+  logs: RequestLogEntry[],
+  timeFilter: string,
+  metric: TrendMetric,
+  costFor: (log: RequestLogEntry) => { usd: number; cny: number } | null,
+  tokenCountFor: (log: RequestLogEntry) => number,
+) {
+  const sorted = [...logs].sort((a, b) => a.timestamp - b.timestamp);
+  const keyStats = new Map<string, TrendRanking>();
+
+  for (const log of sorted) {
+    const name = logKeyName(log);
+    const current = keyStats.get(name) ?? {
+      name,
+      value: 0,
+      requests: 0,
+      errors: 0,
+      lastTs: 0,
+    };
+    current.value += trendValueForLog(log, metric, costFor, tokenCountFor);
+    current.requests += 1;
+    if (log.status >= 400 || log.error) current.errors += 1;
+    current.lastTs = Math.max(current.lastTs, log.timestamp);
+    keyStats.set(name, current);
+  }
+
+  const rankings = [...keyStats.values()].sort(
+    (a, b) => b.value - a.value || b.requests - a.requests || b.lastTs - a.lastTs,
+  );
+
+  if (sorted.length === 0) {
+    return {
+      activeKeys: 0,
+      buckets: [] as TrendBucket[],
+      rankings,
+      series: [] as TrendSeries[],
+      maxBucketValue: 1,
+      peakBucket: null as TrendBucket | null,
+      recentBucket: null as TrendBucket | null,
+    };
+  }
+
+  let end = Math.floor(Date.now() / 1000);
+  let start = sorted[0].timestamp;
+  if (timeFilter === "1h") start = end - 3600;
+  if (timeFilter === "24h") start = end - 86400;
+  if (timeFilter === "7d") start = end - 7 * 86400;
+  if (timeFilter === "all") {
+    end = Math.max(end, sorted[sorted.length - 1].timestamp);
+    if (end - start < 3600) start = end - 3600;
+  }
+
+  const span = Math.max(60, end - start);
+  const bucketCount =
+    timeFilter === "1h"
+      ? 12
+      : timeFilter === "24h"
+        ? 24
+        : timeFilter === "7d"
+          ? 14
+          : Math.min(18, Math.max(8, Math.ceil(span / 3600)));
+  const bucketSize = Math.max(60, Math.ceil(span / bucketCount));
+  const bucketStart = end - bucketSize * bucketCount;
+  const buckets: TrendBucket[] = Array.from({ length: bucketCount }, (_, index) => {
+    const bucketTs = bucketStart + index * bucketSize;
+    return {
+      label: formatBucketLabel(bucketTs, span),
+      rangeLabel: `${formatBucketLabel(bucketTs, span)} - ${formatBucketLabel(bucketTs + bucketSize, span)}`,
+      total: 0,
+      values: new Map<string, number>(),
+    };
+  });
+
+  const topNames = rankings.slice(0, 5).map((item) => item.name);
+  const hasOther = rankings.length > topNames.length;
+  const topNameSet = new Set(topNames);
+
+  for (const log of sorted) {
+    if (log.timestamp < bucketStart || log.timestamp > end) continue;
+    const value = trendValueForLog(log, metric, costFor, tokenCountFor);
+    const key = logKeyName(log);
+    const seriesName = topNameSet.has(key) ? key : hasOther ? "其他" : key;
+    const index = Math.min(
+      buckets.length - 1,
+      Math.max(0, Math.floor((log.timestamp - bucketStart) / bucketSize)),
+    );
+    const bucket = buckets[index];
+    bucket.total += value;
+    bucket.values.set(seriesName, (bucket.values.get(seriesName) ?? 0) + value);
+  }
+
+  const seriesNames = hasOther ? [...topNames, "其他"] : topNames;
+  const series = seriesNames.map((name, index) => ({
+    name,
+    color: trendColors[index % trendColors.length],
+    value:
+      name === "其他"
+        ? rankings.slice(5).reduce((sum, item) => sum + item.value, 0)
+        : keyStats.get(name)?.value ?? 0,
+  }));
+  const maxBucketValue = Math.max(...buckets.map((bucket) => bucket.total), 1);
+  const peakBucket = buckets.reduce<TrendBucket | null>(
+    (peak, bucket) => (!peak || bucket.total > peak.total ? bucket : peak),
+    null,
+  );
+
+  return {
+    activeKeys: keyStats.size,
+    buckets,
+    rankings,
+    series,
+    maxBucketValue,
+    peakBucket: peakBucket && peakBucket.total > 0 ? peakBucket : null,
+    recentBucket: buckets[buckets.length - 1] ?? null,
+  };
 }
 
 export default function Logs() {
@@ -71,6 +278,7 @@ export default function Logs() {
   const [providerFilter, setProviderFilter] = useState("all");
   const [keyFilter, setKeyFilter] = useState("all");
   const [timeFilter, setTimeFilter] = useState("all");
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>("requests");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const pageSize = 20;
@@ -113,13 +321,23 @@ export default function Logs() {
   const priceMap = new Map(
     (config?.model_prices ?? [])
       .filter((price) => price.model.trim())
-      .map((price) => [price.model.toLowerCase(), price]),
+      .map((price) => [price.model.trim().toLowerCase(), price]),
   );
+  const providerProtocolMap = new Map<string, Provider["protocol"]>();
+  for (const provider of config?.providers ?? []) {
+    providerProtocolMap.set(provider.id, provider.protocol);
+    providerProtocolMap.set(provider.name, provider.protocol);
+  }
 
   const filteredLogs = logs.filter((log) => {
     if (modelFilter !== "all" && log.model !== modelFilter) return false;
     if (providerFilter !== "all" && log.provider !== providerFilter) return false;
-    if (keyFilter !== "all" && log.api_key_name !== keyFilter) return false;
+    if (keyFilter === unverifiedKeyFilter && log.api_key_name) return false;
+    if (
+      keyFilter !== "all" &&
+      keyFilter !== unverifiedKeyFilter &&
+      log.api_key_name !== keyFilter
+    ) return false;
     if (query.trim()) {
       const q = query.toLowerCase();
       const text = `${log.path} ${log.model} ${log.provider} ${log.api_key_name} ${log.error ?? ""}`.toLowerCase();
@@ -133,16 +351,28 @@ export default function Logs() {
   });
 
   const costFor = (log: RequestLogEntry) => {
-    const price = priceMap.get(log.model.toLowerCase());
+    const price = priceMap.get(log.model.trim().toLowerCase());
     if (!price) return null;
+    // OpenAI reports cached tokens as a subset of prompt_tokens. Anthropic
+    // reports cache tokens separately from input_tokens.
+    const inputTokens = providerProtocolMap.get(log.provider) === "openai"
+      ? Math.max(0, log.input_tokens - log.cached_tokens)
+      : log.input_tokens;
     const usd =
-      (log.input_tokens / 1_000_000) * price.input_usd_per_million +
+      (inputTokens / 1_000_000) * price.input_usd_per_million +
       (log.output_tokens / 1_000_000) * price.output_usd_per_million +
       (log.cached_tokens / 1_000_000) * price.cached_usd_per_million;
     return {
       usd,
       cny: usd * (config?.usd_to_cny_rate ?? 7.2),
     };
+  };
+
+  const tokenCountFor = (log: RequestLogEntry) => {
+    const cachedTokens = providerProtocolMap.get(log.provider) === "openai"
+      ? 0
+      : log.cached_tokens;
+    return log.input_tokens + log.output_tokens + cachedTokens;
   };
 
   const totals = filteredLogs.reduce(
@@ -156,6 +386,8 @@ export default function Logs() {
     },
     { input: 0, output: 0, cached: 0, usd: 0 },
   );
+  const trendData = buildTrendData(filteredLogs, timeFilter, trendMetric, costFor, tokenCountFor);
+  const rankingMax = Math.max(...trendData.rankings.map((item) => item.value), 1);
 
   const pageCount = Math.max(1, Math.ceil(filteredLogs.length / pageSize));
   const safePage = Math.min(page, pageCount);
@@ -218,6 +450,9 @@ export default function Logs() {
           </select>
           <select className="input-field" value={keyFilter} onChange={(e) => setKeyFilter(e.target.value)}>
             <option value="all">全部密钥</option>
+            {logs.some((log) => !log.api_key_name) && (
+              <option value={unverifiedKeyFilter}>未验证</option>
+            )}
             {keyOptions.map((keyName) => (
               <option key={keyName} value={keyName}>{keyName}</option>
             ))}
@@ -254,6 +489,179 @@ export default function Logs() {
           </div>
         </div>
       </section>
+
+      {!loading && logs.length > 0 && (
+        <section className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1.65fr)_minmax(20rem,0.85fr)]">
+          <div className="panel p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="h-4 w-4 text-cyan-600 dark:text-cyan-300" />
+                  <h2 className="text-sm font-semibold">小号趋势</h2>
+                </div>
+                <p className="mt-1 text-xs text-surface-500 dark:text-surface-400">
+                  按 {trendMetricLabels[trendMetric]} 统计，跟随当前筛选条件
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-1 rounded-lg border border-surface-200 bg-surface-50 p-1 dark:border-surface-800 dark:bg-surface-950 sm:flex">
+                {(["requests", "tokens", "cost", "errors"] as TrendMetric[]).map((metric) => (
+                  <button
+                    key={metric}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                      trendMetric === metric
+                        ? "bg-surface-900 text-white dark:bg-cyan-500 dark:text-surface-950"
+                        : "text-surface-600 hover:bg-white dark:text-surface-300 dark:hover:bg-surface-900"
+                    }`}
+                    onClick={() => setTrendMetric(metric)}
+                  >
+                    {trendMetricLabels[metric]}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                <div className="metric-label">Active Keys</div>
+                <div className="mt-1 flex items-center gap-2 font-semibold">
+                  <KeyRound className="h-3.5 w-3.5 text-amber-600 dark:text-amber-300" />
+                  {trendData.activeKeys}
+                </div>
+              </div>
+              <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                <div className="metric-label">Peak</div>
+                <div className="mt-1 flex items-center gap-2 font-semibold">
+                  <Gauge className="h-3.5 w-3.5 text-cyan-600 dark:text-cyan-300" />
+                  {trendData.peakBucket
+                    ? formatTrendValue(trendData.peakBucket.total, trendMetric, true)
+                    : "0"}
+                </div>
+              </div>
+              <div className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                <div className="metric-label">Latest</div>
+                <div className="mt-1 flex items-center gap-2 font-semibold">
+                  <Clock3 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-300" />
+                  {trendData.recentBucket
+                    ? formatTrendValue(trendData.recentBucket.total, trendMetric, true)
+                    : "0"}
+                </div>
+              </div>
+            </div>
+
+            {filteredLogs.length === 0 ? (
+              <div className="mt-4 flex h-56 items-center justify-center rounded-lg border border-dashed border-surface-300 text-sm text-surface-500 dark:border-surface-700 dark:text-surface-400">
+                当前筛选无可视化数据
+              </div>
+            ) : (
+              <>
+                <div className="mt-4 overflow-x-auto">
+                  <div className="min-w-[42rem]">
+                    <div className="flex h-48 items-end gap-1 border-b border-surface-200 pb-2 dark:border-surface-800">
+                      {trendData.buckets.map((bucket, index) => (
+                        <div key={`${bucket.label}-${index}`} className="group flex h-full min-w-10 flex-1 flex-col justify-end">
+                          <div className="relative flex min-h-0 flex-1 items-end justify-center">
+                            <div
+                              className="w-full max-w-8 overflow-hidden rounded-t-md bg-surface-100 ring-1 ring-surface-200 dark:bg-surface-800 dark:ring-surface-700"
+                              style={{
+                                height: `${bucket.total > 0 ? Math.max(4, (bucket.total / trendData.maxBucketValue) * 100) : 4}%`,
+                                opacity: bucket.total > 0 ? 1 : 0.45,
+                              }}
+                              title={`${bucket.rangeLabel}: ${formatTrendValue(bucket.total, trendMetric)}`}
+                            >
+                              {bucket.total > 0 && (
+                                <div className="flex h-full w-full flex-col-reverse">
+                                  {trendData.series.map((series) => {
+                                    const value = bucket.values.get(series.name) ?? 0;
+                                    if (value <= 0) return null;
+                                    return (
+                                      <div
+                                        key={series.name}
+                                        style={{
+                                          height: `${(value / bucket.total) * 100}%`,
+                                          backgroundColor: series.color,
+                                        }}
+                                      />
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                            <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-2 hidden min-w-44 -translate-x-1/2 rounded-md border border-surface-200 bg-white px-3 py-2 text-xs shadow-lg group-hover:block dark:border-surface-700 dark:bg-surface-950">
+                              <div className="font-medium text-surface-800 dark:text-surface-100">
+                                {bucket.rangeLabel}
+                              </div>
+                              <div className="mt-1 font-mono text-surface-500 dark:text-surface-400">
+                                {formatTrendValue(bucket.total, trendMetric)}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="mt-2 truncate text-center text-[10px] text-surface-500 dark:text-surface-400">
+                            {bucket.label}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {trendData.series.map((series) => (
+                    <span key={series.name} className="inline-flex items-center gap-2 rounded-md bg-surface-50 px-2 py-1 text-xs text-surface-600 dark:bg-surface-950 dark:text-surface-300">
+                      <span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: series.color }} />
+                      <span className="max-w-36 truncate" title={series.name}>{series.name}</span>
+                      <span className="font-mono text-surface-500 dark:text-surface-400">
+                        {formatTrendValue(series.value, trendMetric, true)}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="panel p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <KeyRound className="h-4 w-4 text-amber-600 dark:text-amber-300" />
+                <h2 className="text-sm font-semibold">小号排行</h2>
+              </div>
+              <span className="badge badge-neutral">{trendMetricLabels[trendMetric]}</span>
+            </div>
+            {trendData.rankings.length === 0 ? (
+              <div className="flex h-56 items-center justify-center rounded-lg border border-dashed border-surface-300 text-sm text-surface-500 dark:border-surface-700 dark:text-surface-400">
+                暂无排行数据
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {trendData.rankings.slice(0, 8).map((item, index) => {
+                  const color = trendColors[index % trendColors.length];
+                  const percent = item.value > 0 ? Math.max(4, (item.value / rankingMax) * 100) : 2;
+                  return (
+                    <div key={item.name}>
+                      <div className="mb-1.5 flex items-center justify-between gap-3 text-sm">
+                        <span className="min-w-0 truncate font-medium text-surface-700 dark:text-surface-200" title={item.name}>
+                          {item.name}
+                        </span>
+                        <span className="shrink-0 font-mono text-xs text-surface-500 dark:text-surface-400">
+                          {formatTrendValue(item.value, trendMetric, true)}
+                        </span>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-surface-100 dark:bg-surface-800">
+                        <div className="h-full rounded-full" style={{ width: `${percent}%`, backgroundColor: color }} />
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-surface-500 dark:text-surface-400">
+                        <span>{item.requests} 次请求</span>
+                        {item.errors > 0 && <span className="text-red-600 dark:text-red-400">{item.errors} 错误</span>}
+                        <span>最近 {formatRelativeTime(item.lastTs)}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
 
       {loading ? (
         <div className="flex h-64 items-center justify-center">

@@ -202,7 +202,7 @@ async fn health_handler() -> impl IntoResponse {
 async fn list_models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
     let config = state.config.read().await;
     if let Err(response) = authorize_proxy_request(&headers, &config) {
-        return response;
+        return *response;
     }
 
     let mut models: Vec<Value> = Vec::new();
@@ -384,7 +384,10 @@ fn auth_error_response() -> Response {
         .into_response()
 }
 
-fn authorize_proxy_request(headers: &HeaderMap, config: &AppConfig) -> Result<String, Response> {
+fn authorize_proxy_request(
+    headers: &HeaderMap,
+    config: &AppConfig,
+) -> Result<String, Box<Response>> {
     let mut active_keys: Vec<(&str, &str)> = config
         .proxy_api_keys
         .iter()
@@ -401,7 +404,7 @@ fn authorize_proxy_request(headers: &HeaderMap, config: &AppConfig) -> Result<St
     }
 
     let Some(incoming_key) = incoming_api_key(headers) else {
-        return Err(auth_error_response());
+        return Err(Box::new(auth_error_response()));
     };
 
     active_keys
@@ -413,7 +416,7 @@ fn authorize_proxy_request(headers: &HeaderMap, config: &AppConfig) -> Result<St
                 None
             }
         })
-        .ok_or_else(auth_error_response)
+        .ok_or_else(|| Box::new(auth_error_response()))
 }
 
 fn bad_gateway(message: impl Into<String>) -> Response {
@@ -1696,7 +1699,7 @@ async fn anthropic_handler(
     let config = state.config.read().await;
     let api_key_name = match authorize_proxy_request(&headers, &config) {
         Ok(name) => name,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let mut body_json: Value = match serde_json::from_slice(&body) {
@@ -1716,10 +1719,7 @@ async fn anthropic_handler(
         }
     };
 
-    let raw_model = body_json
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let raw_model = body_json.get("model").and_then(Value::as_str).unwrap_or("");
     let resolved_model = resolve_model_alias(&config, raw_model).to_string();
     drop(config);
 
@@ -1977,7 +1977,7 @@ async fn proxy_handler(
     let config = state.config.read().await;
     let api_key_name = match authorize_proxy_request(&headers, &config) {
         Ok(name) => name,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let mut body_json: Value = match serde_json::from_slice(&body) {
@@ -2434,7 +2434,11 @@ mod tests {
             providers: vec![provider(format!("http://{}", upstream_addr), 0)],
             ..Default::default()
         };
-        let proxy = create_proxy_router_with_stats(Arc::new(RwLock::new(config)), stats.clone(), Arc::new(RwLock::new(std::collections::VecDeque::new())));
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            stats.clone(),
+            Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        );
         let (proxy_addr, proxy_task) = spawn_router(proxy).await;
 
         let response = reqwest::Client::new()
@@ -2867,9 +2871,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(
-            request.get("temperature").is_none() || !request["temperature"].is_null()
-        );
+        assert!(request.get("temperature").is_none() || !request["temperature"].is_null());
         assert!(
             request.get("stop_sequences").is_none(),
             "stop_sequences should be omitted when stop is null, got: {:?}",
