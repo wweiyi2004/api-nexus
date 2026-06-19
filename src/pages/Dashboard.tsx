@@ -25,9 +25,11 @@ interface RequestLogEntry {
   path: string;
   model: string;
   provider: string;
+  api_key_name: string;
   status: number;
   input_tokens: number;
   output_tokens: number;
+  cached_tokens: number;
   duration_ms: number;
   error: string | null;
 }
@@ -153,17 +155,18 @@ export default function Dashboard() {
   }, [config]);
 
   const perProvider = useMemo(() => {
-    const map = new Map<string, { input: number; output: number; count: number; errors: number }>();
+    const map = new Map<string, { input: number; output: number; cached: number; count: number; errors: number }>();
     for (const log of logs) {
       const key = log.provider || "(未知)";
-      const entry = map.get(key) ?? { input: 0, output: 0, count: 0, errors: 0 };
+      const entry = map.get(key) ?? { input: 0, output: 0, cached: 0, count: 0, errors: 0 };
       entry.input += log.input_tokens;
       entry.output += log.output_tokens;
+      entry.cached += log.cached_tokens;
       entry.count += 1;
       if (log.status >= 400) entry.errors += 1;
       map.set(key, entry);
     }
-    return [...map.entries()].sort((a, b) => (b[1].input + b[1].output) - (a[1].input + a[1].output));
+    return [...map.entries()].sort((a, b) => (b[1].input + b[1].output + b[1].cached) - (a[1].input + a[1].output + a[1].cached));
   }, [logs]);
 
   const baseUrl = status?.url ?? `http://${config?.proxy_host ?? "127.0.0.1"}:${config?.proxy_port ?? 11434}`;
@@ -324,8 +327,8 @@ export default function Dashboard() {
           </div>
           <div className="space-y-2">
             {perProvider.map(([name, usage]) => {
-              const total = usage.input + usage.output;
-              const maxTotal = perProvider[0][1].input + perProvider[0][1].output || 1;
+              const total = usage.input + usage.output + usage.cached;
+              const maxTotal = perProvider[0][1].input + perProvider[0][1].output + perProvider[0][1].cached || 1;
               return (
                 <div key={name} className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
                   <div className="mb-1.5 flex items-center justify-between text-sm">
@@ -333,6 +336,7 @@ export default function Dashboard() {
                     <span className="flex items-center gap-3 font-mono text-xs text-surface-500 dark:text-surface-400">
                       <span className="text-emerald-600 dark:text-emerald-300">↓{formatTokens(usage.input)}</span>
                       <span className="text-sky-600 dark:text-sky-300">↑{formatTokens(usage.output)}</span>
+                      {usage.cached > 0 && <span className="text-violet-600 dark:text-violet-300">C{formatTokens(usage.cached)}</span>}
                       <span>{usage.count} 次</span>
                       {usage.errors > 0 && (
                         <span className="text-red-600 dark:text-red-400">{usage.errors} 错误</span>

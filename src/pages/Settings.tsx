@@ -1,10 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CheckCircle2, Clipboard, KeyRound, Power, Save, ServerCog, Tags, Trash2, Plus } from "lucide-react";
+import { CheckCircle2, CircleOff, Clipboard, KeyRound, Power, Save, ServerCog, Tags, Trash2, Plus } from "lucide-react";
 
 interface ModelAlias {
   alias: string;
   model: string;
+}
+
+interface ProxyApiKey {
+  id: string;
+  name: string;
+  key: string;
+  enabled: boolean;
+}
+
+interface ModelPrice {
+  model: string;
+  input_usd_per_million: number;
+  output_usd_per_million: number;
+  cached_usd_per_million: number;
 }
 
 interface AppConfig {
@@ -13,10 +27,23 @@ interface AppConfig {
   proxy_host: string;
   auto_start: boolean;
   proxy_api_key: string;
+  proxy_api_keys: ProxyApiKey[];
   model_aliases: ModelAlias[];
+  model_prices: ModelPrice[];
+  usd_to_cny_rate: number;
 }
 
 const emptyAlias: ModelAlias = { alias: "", model: "" };
+const emptyPrice: ModelPrice = {
+  model: "",
+  input_usd_per_million: 0,
+  output_usd_per_million: 0,
+  cached_usd_per_million: 0,
+};
+
+function generateProxyKey() {
+  return `sk-nexus-${crypto.randomUUID().replaceAll("-", "")}`;
+}
 
 export default function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -24,6 +51,7 @@ export default function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [newAlias, setNewAlias] = useState<ModelAlias>(emptyAlias);
+  const [newPrice, setNewPrice] = useState<ModelPrice>(emptyPrice);
 
   useEffect(() => {
     (async () => {
@@ -147,29 +175,90 @@ export default function Settings() {
       </section>
 
       <section className="panel">
-        <div className="flex items-center gap-2 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
-          <KeyRound className="h-4 w-4 text-amber-600 dark:text-amber-300" />
-          <h2 className="text-sm font-semibold">统一 API 密钥</h2>
-        </div>
-        <div className="grid grid-cols-1 gap-4 p-4 lg:grid-cols-[1fr_auto_auto]">
-          <input
-            className="input-field"
-            type="password"
-            placeholder="留空保存将自动生成随机密钥"
-            value={config.proxy_api_key}
-            onChange={(e) => setConfig({ ...config, proxy_api_key: e.target.value })}
-          />
+        <div className="flex items-center justify-between gap-3 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
+          <div className="flex items-center gap-2">
+            <KeyRound className="h-4 w-4 text-amber-600 dark:text-amber-300" />
+            <h2 className="text-sm font-semibold">客户端 API 密钥</h2>
+          </div>
           <button
-            className="btn-icon self-center"
-            title="复制密钥"
-            onClick={() => copy(config.proxy_api_key, "proxy-key")}
-            disabled={!config.proxy_api_key}
+            className="btn-secondary"
+            onClick={() =>
+              setConfig({
+                ...config,
+                proxy_api_keys: [
+                  ...config.proxy_api_keys,
+                  {
+                    id: crypto.randomUUID(),
+                    name: `密钥 ${config.proxy_api_keys.length + 1}`,
+                    key: generateProxyKey(),
+                    enabled: true,
+                  },
+                ],
+              })
+            }
           >
-            {copied === "proxy-key" ? <CheckCircle2 className="h-4 w-4" /> : <Clipboard className="h-4 w-4" />}
+            <Plus className="h-4 w-4" />
+            新增密钥
           </button>
-          <span className={config.proxy_api_key ? "badge badge-success self-center" : "badge badge-warning self-center"}>
-            {config.proxy_api_key ? "已启用" : "保存后自动生成"}
-          </span>
+        </div>
+        <div className="space-y-2 p-4">
+          {config.proxy_api_keys.map((apiKey, index) => (
+            <div key={apiKey.id || index} className="grid grid-cols-1 gap-2 rounded-lg border border-surface-200 p-3 dark:border-surface-800 lg:grid-cols-[14rem_1fr_auto_auto_auto]">
+              <input
+                className="input-field"
+                placeholder="备注名称"
+                value={apiKey.name}
+                onChange={(e) => {
+                  const next = [...config.proxy_api_keys];
+                  next[index] = { ...apiKey, name: e.target.value };
+                  setConfig({ ...config, proxy_api_keys: next });
+                }}
+              />
+              <input
+                className="input-field font-mono"
+                type="password"
+                value={apiKey.key}
+                onChange={(e) => {
+                  const next = [...config.proxy_api_keys];
+                  next[index] = { ...apiKey, key: e.target.value };
+                  setConfig({ ...config, proxy_api_keys: next });
+                }}
+              />
+              <button
+                className="btn-secondary"
+                onClick={() => {
+                  const next = [...config.proxy_api_keys];
+                  next[index] = { ...apiKey, enabled: !apiKey.enabled };
+                  setConfig({ ...config, proxy_api_keys: next });
+                }}
+              >
+                {apiKey.enabled ? <CheckCircle2 className="h-4 w-4" /> : <CircleOff className="h-4 w-4" />}
+                {apiKey.enabled ? "启用" : "禁用"}
+              </button>
+              <button
+                className="btn-icon"
+                title="复制密钥"
+                onClick={() => copy(apiKey.key, `proxy-key-${apiKey.id || index}`)}
+                disabled={!apiKey.key}
+              >
+                {copied === `proxy-key-${apiKey.id || index}` ? <CheckCircle2 className="h-4 w-4" /> : <Clipboard className="h-4 w-4" />}
+              </button>
+              <button
+                className="btn-icon"
+                title="删除"
+                disabled={config.proxy_api_keys.length <= 1}
+                onClick={() => {
+                  const next = config.proxy_api_keys.filter((_, i) => i !== index);
+                  setConfig({ ...config, proxy_api_keys: next });
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+          <div className="text-xs text-surface-500 dark:text-surface-400">
+            请求命中的密钥备注会写入请求日志，便于按客户端或用途筛选。
+          </div>
         </div>
       </section>
 
@@ -257,6 +346,151 @@ export default function Settings() {
                   });
                   setNewAlias(emptyAlias);
                 }
+              }}
+            >
+              <Plus className="h-4 w-4" />
+              添加
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="flex items-center justify-between gap-3 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
+          <div className="flex items-center gap-2">
+            <Tags className="h-4 w-4 text-emerald-600 dark:text-emerald-300" />
+            <h2 className="text-sm font-semibold">模型价格</h2>
+            <span className="ml-2 text-xs text-surface-500 dark:text-surface-400">
+              单位为美元 / 100 万 tokens
+            </span>
+          </div>
+          <label className="flex items-center gap-2 text-xs text-surface-500 dark:text-surface-400">
+            USD/CNY
+            <input
+              className="input-field w-24"
+              type="number"
+              step="0.01"
+              min="0"
+              value={config.usd_to_cny_rate}
+              onChange={(e) =>
+                setConfig({ ...config, usd_to_cny_rate: parseFloat(e.target.value) || 7.2 })
+              }
+            />
+          </label>
+        </div>
+        <div className="space-y-2 p-4">
+          {config.model_prices.map((price, index) => (
+            <div key={`${price.model}-${index}`} className="grid grid-cols-1 gap-2 lg:grid-cols-[1fr_repeat(3,9rem)_auto]">
+              <input
+                className="input-field"
+                placeholder="模型名"
+                value={price.model}
+                onChange={(e) => {
+                  const next = [...config.model_prices];
+                  next[index] = { ...price, model: e.target.value };
+                  setConfig({ ...config, model_prices: next });
+                }}
+              />
+              <input
+                className="input-field"
+                type="number"
+                min="0"
+                step="0.0001"
+                placeholder="Input"
+                value={price.input_usd_per_million}
+                onChange={(e) => {
+                  const next = [...config.model_prices];
+                  next[index] = { ...price, input_usd_per_million: parseFloat(e.target.value) || 0 };
+                  setConfig({ ...config, model_prices: next });
+                }}
+              />
+              <input
+                className="input-field"
+                type="number"
+                min="0"
+                step="0.0001"
+                placeholder="Output"
+                value={price.output_usd_per_million}
+                onChange={(e) => {
+                  const next = [...config.model_prices];
+                  next[index] = { ...price, output_usd_per_million: parseFloat(e.target.value) || 0 };
+                  setConfig({ ...config, model_prices: next });
+                }}
+              />
+              <input
+                className="input-field"
+                type="number"
+                min="0"
+                step="0.0001"
+                placeholder="Cache"
+                value={price.cached_usd_per_million}
+                onChange={(e) => {
+                  const next = [...config.model_prices];
+                  next[index] = { ...price, cached_usd_per_million: parseFloat(e.target.value) || 0 };
+                  setConfig({ ...config, model_prices: next });
+                }}
+              />
+              <button
+                className="btn-icon"
+                title="删除"
+                onClick={() => {
+                  const next = config.model_prices.filter((_, i) => i !== index);
+                  setConfig({ ...config, model_prices: next });
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+          {config.model_prices.length === 0 && (
+            <div className="py-2 text-center text-xs text-surface-400">
+              暂无价格。添加后请求日志会自动计算每条请求费用。
+            </div>
+          )}
+          <div className="grid grid-cols-1 gap-2 pt-2 lg:grid-cols-[1fr_repeat(3,9rem)_auto]">
+            <input
+              className="input-field"
+              placeholder="模型名"
+              value={newPrice.model}
+              onChange={(e) => setNewPrice({ ...newPrice, model: e.target.value })}
+            />
+            <input
+              className="input-field"
+              type="number"
+              min="0"
+              step="0.0001"
+              placeholder="Input"
+              value={newPrice.input_usd_per_million}
+              onChange={(e) => setNewPrice({ ...newPrice, input_usd_per_million: parseFloat(e.target.value) || 0 })}
+            />
+            <input
+              className="input-field"
+              type="number"
+              min="0"
+              step="0.0001"
+              placeholder="Output"
+              value={newPrice.output_usd_per_million}
+              onChange={(e) => setNewPrice({ ...newPrice, output_usd_per_million: parseFloat(e.target.value) || 0 })}
+            />
+            <input
+              className="input-field"
+              type="number"
+              min="0"
+              step="0.0001"
+              placeholder="Cache"
+              value={newPrice.cached_usd_per_million}
+              onChange={(e) => setNewPrice({ ...newPrice, cached_usd_per_million: parseFloat(e.target.value) || 0 })}
+            />
+            <button
+              className="btn-secondary"
+              disabled={!newPrice.model.trim()}
+              onClick={() => {
+                if (!newPrice.model.trim()) return;
+                setConfig({
+                  ...config,
+                  model_prices: [...config.model_prices, { ...newPrice }],
+                });
+                setNewPrice(emptyPrice);
               }}
             >
               <Plus className="h-4 w-4" />

@@ -39,9 +39,7 @@ pub async fn save_config_cmd(
     mut config: AppConfig,
 ) -> Result<AppConfig, String> {
     let state_arc: &Arc<AppState> = state.inner();
-    if config.proxy_api_key.trim().is_empty() {
-        config.proxy_api_key = config::generate_proxy_api_key();
-    }
+    config = config::normalize_config(config);
 
     let restart_required = {
         let current = state.config.read().await;

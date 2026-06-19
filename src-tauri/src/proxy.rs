@@ -70,16 +70,18 @@ pub struct RequestLogEntry {
     pub path: String,
     pub model: String,
     pub provider: String,
+    pub api_key_name: String,
     pub status: u16,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_tokens: u64,
     pub duration_ms: u64,
     pub error: Option<String>,
 }
 
 pub type RequestLogState = Arc<RwLock<std::collections::VecDeque<RequestLogEntry>>>;
 
-const MAX_LOG_ENTRIES: usize = 100;
+const MAX_LOG_ENTRIES: usize = 1000;
 
 pub async fn push_request_log(state: &RequestLogState, entry: RequestLogEntry) {
     let mut logs = state.write().await;
@@ -96,6 +98,7 @@ async fn log_request(
     path: &str,
     model: &str,
     provider: &str,
+    api_key_name: &str,
     status: u16,
     usage: TokenUsage,
     started: std::time::Instant,
@@ -107,13 +110,26 @@ async fn log_request(
         path: path.to_string(),
         model: model.to_string(),
         provider: provider.to_string(),
+        api_key_name: api_key_name.to_string(),
         status,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
+        cached_tokens: usage.cached_tokens,
         duration_ms: started.elapsed().as_millis() as u64,
         error,
     };
     push_request_log(logs, entry).await;
+}
+
+#[derive(Clone)]
+struct RequestLogContext {
+    method: &'static str,
+    path: String,
+    model: String,
+    provider: String,
+    api_key_name: String,
+    status: u16,
+    started: std::time::Instant,
 }
 #[derive(Clone)]
 pub struct ProxyState {
@@ -185,7 +201,7 @@ async fn health_handler() -> impl IntoResponse {
 
 async fn list_models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
     let config = state.config.read().await;
-    if let Some(response) = proxy_api_key_error(&headers, &config) {
+    if let Err(response) = authorize_proxy_request(&headers, &config) {
         return response;
     }
 
@@ -368,15 +384,36 @@ fn auth_error_response() -> Response {
         .into_response()
 }
 
-fn proxy_api_key_error(headers: &HeaderMap, config: &AppConfig) -> Option<Response> {
-    if config.proxy_api_key.is_empty() {
-        return None;
+fn authorize_proxy_request(headers: &HeaderMap, config: &AppConfig) -> Result<String, Response> {
+    let mut active_keys: Vec<(&str, &str)> = config
+        .proxy_api_keys
+        .iter()
+        .filter(|key| key.enabled && !key.key.trim().is_empty())
+        .map(|key| (key.key.as_str(), key.name.as_str()))
+        .collect();
+
+    if active_keys.is_empty() && !config.proxy_api_key.trim().is_empty() {
+        active_keys.push((config.proxy_api_key.as_str(), "默认密钥"));
     }
 
-    match incoming_api_key(headers) {
-        Some(incoming_key) if incoming_key == config.proxy_api_key => None,
-        _ => Some(auth_error_response()),
+    if active_keys.is_empty() {
+        return Ok("未验证".to_string());
     }
+
+    let Some(incoming_key) = incoming_api_key(headers) else {
+        return Err(auth_error_response());
+    };
+
+    active_keys
+        .into_iter()
+        .find_map(|(key, name)| {
+            if incoming_key == key {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(auth_error_response)
 }
 
 fn bad_gateway(message: impl Into<String>) -> Response {
@@ -471,6 +508,8 @@ async fn passthrough_response(
     resp: reqwest::Response,
     is_stream: bool,
     token_stats: TokenStatsState,
+    request_logs: RequestLogState,
+    log_context: RequestLogContext,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
@@ -509,8 +548,49 @@ async fn passthrough_response(
                 usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
             }
             record_token_usage(&token_stats, usage).await;
+            log_request(
+                &request_logs,
+                log_context.method,
+                &log_context.path,
+                &log_context.model,
+                &log_context.provider,
+                &log_context.api_key_name,
+                log_context.status,
+                usage,
+                log_context.started,
+                None,
+            )
+            .await;
         } else if let Ok(body_json) = serde_json::from_slice::<Value>(&accumulated) {
-            record_token_usage(&token_stats, extract_token_usage(&body_json)).await;
+            let usage = extract_token_usage(&body_json);
+            record_token_usage(&token_stats, usage).await;
+            log_request(
+                &request_logs,
+                log_context.method,
+                &log_context.path,
+                &log_context.model,
+                &log_context.provider,
+                &log_context.api_key_name,
+                log_context.status,
+                usage,
+                log_context.started,
+                None,
+            )
+            .await;
+        } else {
+            log_request(
+                &request_logs,
+                log_context.method,
+                &log_context.path,
+                &log_context.model,
+                &log_context.provider,
+                &log_context.api_key_name,
+                log_context.status,
+                TokenUsage::default(),
+                log_context.started,
+                Some("Failed to parse response usage".to_string()),
+            )
+            .await;
         }
     };
 
@@ -1221,6 +1301,8 @@ async fn openai_stream_to_anthropic_response(
     resp: reqwest::Response,
     model: String,
     token_stats: TokenStatsState,
+    request_logs: RequestLogState,
+    log_context: RequestLogContext,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let stream = async_stream::stream! {
@@ -1415,6 +1497,19 @@ async fn openai_stream_to_anthropic_response(
         }))));
 
         record_token_usage(&token_stats, usage).await;
+        log_request(
+            &request_logs,
+            log_context.method,
+            &log_context.path,
+            &log_context.model,
+            &log_context.provider,
+            &log_context.api_key_name,
+            log_context.status,
+            usage,
+            log_context.started,
+            None,
+        )
+        .await;
     };
 
     Response::builder()
@@ -1496,6 +1591,8 @@ async fn anthropic_stream_to_openai_response(
     resp: reqwest::Response,
     model: String,
     token_stats: TokenStatsState,
+    request_logs: RequestLogState,
+    log_context: RequestLogContext,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let stream = async_stream::stream! {
@@ -1543,6 +1640,19 @@ async fn anthropic_stream_to_openai_response(
         }
 
         record_token_usage(&token_stats, usage).await;
+        log_request(
+            &request_logs,
+            log_context.method,
+            &log_context.path,
+            &log_context.model,
+            &log_context.provider,
+            &log_context.api_key_name,
+            log_context.status,
+            usage,
+            log_context.started,
+            None,
+        )
+        .await;
     };
 
     Response::builder()
@@ -1584,9 +1694,10 @@ async fn anthropic_handler(
     let started = std::time::Instant::now();
 
     let config = state.config.read().await;
-    if let Some(response) = proxy_api_key_error(&headers, &config) {
-        return response;
-    }
+    let api_key_name = match authorize_proxy_request(&headers, &config) {
+        Ok(name) => name,
+        Err(response) => return response,
+    };
 
     let mut body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1639,6 +1750,7 @@ async fn anthropic_handler(
             &request_path,
             &model,
             "",
+            &api_key_name,
             404,
             TokenUsage::default(),
             started,
@@ -1674,19 +1786,23 @@ async fn anthropic_handler(
                         continue;
                     }
 
-                    log_request(
-                        &state.request_logs,
-                        "POST",
-                        &request_path,
-                        &model,
-                        &provider.name,
-                        200,
-                        TokenUsage::default(),
-                        started,
-                        None,
+                    let status = resp.status().as_u16();
+                    return passthrough_response(
+                        resp,
+                        is_stream,
+                        state.token_stats.clone(),
+                        state.request_logs.clone(),
+                        RequestLogContext {
+                            method: "POST",
+                            path: request_path.clone(),
+                            model: model.clone(),
+                            provider: provider.name.clone(),
+                            api_key_name: api_key_name.clone(),
+                            status,
+                            started,
+                        },
                     )
                     .await;
-                    return passthrough_response(resp, is_stream, state.token_stats.clone()).await;
                 }
                 Err(err) => {
                     errors.push(format!("{}: {}", provider.name, err));
@@ -1702,6 +1818,7 @@ async fn anthropic_handler(
                 &request_path,
                 &model,
                 &provider.name,
+                &api_key_name,
                 200,
                 TokenUsage::default(),
                 started,
@@ -1749,22 +1866,20 @@ async fn anthropic_handler(
                 }
 
                 if is_stream {
-                    log_request(
-                        &state.request_logs,
-                        "POST",
-                        &request_path,
-                        &model,
-                        &provider.name,
-                        200,
-                        TokenUsage::default(),
-                        started,
-                        None,
-                    )
-                    .await;
                     return openai_stream_to_anthropic_response(
                         resp,
                         model.clone(),
                         state.token_stats.clone(),
+                        state.request_logs.clone(),
+                        RequestLogContext {
+                            method: "POST",
+                            path: request_path.clone(),
+                            model: model.clone(),
+                            provider: provider.name.clone(),
+                            api_key_name: api_key_name.clone(),
+                            status: 200,
+                            started,
+                        },
                     )
                     .await;
                 }
@@ -1779,6 +1894,7 @@ async fn anthropic_handler(
                             &request_path,
                             &model,
                             &provider.name,
+                            &api_key_name,
                             200,
                             usage,
                             started,
@@ -1810,6 +1926,7 @@ async fn anthropic_handler(
         &request_path,
         &model,
         "",
+        &api_key_name,
         502,
         TokenUsage::default(),
         started,
@@ -1858,9 +1975,10 @@ async fn proxy_handler(
     let started = std::time::Instant::now();
 
     let config = state.config.read().await;
-    if let Some(response) = proxy_api_key_error(&headers, &config) {
-        return response;
-    }
+    let api_key_name = match authorize_proxy_request(&headers, &config) {
+        Ok(name) => name,
+        Err(response) => return response,
+    };
 
     let mut body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1912,6 +2030,7 @@ async fn proxy_handler(
             &request_path,
             &model,
             "",
+            &api_key_name,
             404,
             TokenUsage::default(),
             started,
@@ -1955,22 +2074,20 @@ async fn proxy_handler(
                     }
 
                     if is_stream {
-                        log_request(
-                            &state.request_logs,
-                            "POST",
-                            &request_path,
-                            &model,
-                            &provider.name,
-                            200,
-                            TokenUsage::default(),
-                            started,
-                            None,
-                        )
-                        .await;
                         return anthropic_stream_to_openai_response(
                             resp,
                             model.clone(),
                             state.token_stats.clone(),
+                            state.request_logs.clone(),
+                            RequestLogContext {
+                                method: "POST",
+                                path: request_path.clone(),
+                                model: model.clone(),
+                                provider: provider.name.clone(),
+                                api_key_name: api_key_name.clone(),
+                                status: 200,
+                                started,
+                            },
                         )
                         .await;
                     }
@@ -1985,6 +2102,7 @@ async fn proxy_handler(
                                 &request_path,
                                 &model,
                                 &provider.name,
+                                &api_key_name,
                                 200,
                                 usage,
                                 started,
@@ -2031,19 +2149,23 @@ async fn proxy_handler(
                     continue;
                 }
 
-                log_request(
-                    &state.request_logs,
-                    "POST",
-                    &request_path,
-                    &model,
-                    &provider.name,
-                    200,
-                    TokenUsage::default(),
-                    started,
-                    None,
+                let status = resp.status().as_u16();
+                return passthrough_response(
+                    resp,
+                    is_stream,
+                    state.token_stats.clone(),
+                    state.request_logs.clone(),
+                    RequestLogContext {
+                        method: "POST",
+                        path: request_path.clone(),
+                        model: model.clone(),
+                        provider: provider.name.clone(),
+                        api_key_name: api_key_name.clone(),
+                        status,
+                        started,
+                    },
                 )
                 .await;
-                return passthrough_response(resp, is_stream, state.token_stats.clone()).await;
             }
             Err(e) => {
                 errors.push(format!("{}: {}", provider.name, e));
@@ -2058,6 +2180,7 @@ async fn proxy_handler(
         &request_path,
         &model,
         "",
+        &api_key_name,
         502,
         TokenUsage::default(),
         started,

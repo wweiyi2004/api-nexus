@@ -16,7 +16,25 @@ pub struct AppConfig {
     #[serde(default)]
     pub proxy_api_key: String,
     #[serde(default)]
+    pub proxy_api_keys: Vec<ProxyApiKey>,
+    #[serde(default)]
     pub model_aliases: Vec<ModelAlias>,
+    #[serde(default)]
+    pub model_prices: Vec<ModelPrice>,
+    #[serde(default = "default_usd_to_cny_rate")]
+    pub usd_to_cny_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyApiKey {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default = "default_provider_enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +43,18 @@ pub struct ModelAlias {
     pub alias: String,
     #[serde(default)]
     pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPrice {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub input_usd_per_million: f64,
+    #[serde(default)]
+    pub output_usd_per_million: f64,
+    #[serde(default)]
+    pub cached_usd_per_million: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +89,10 @@ fn default_auto_start() -> bool {
     true
 }
 
+fn default_usd_to_cny_rate() -> f64 {
+    7.2
+}
+
 fn default_provider_enabled() -> bool {
     true
 }
@@ -75,7 +109,10 @@ impl Default for AppConfig {
             proxy_host: default_proxy_host(),
             auto_start: default_auto_start(),
             proxy_api_key: String::new(),
+            proxy_api_keys: Vec::new(),
             model_aliases: Vec::new(),
+            model_prices: Vec::new(),
+            usd_to_cny_rate: default_usd_to_cny_rate(),
         }
     }
 }
@@ -120,6 +157,52 @@ pub fn generate_proxy_api_key() -> String {
     format!("sk-nexus-{}", uuid::Uuid::new_v4().simple())
 }
 
+pub fn normalize_config(mut config: AppConfig) -> AppConfig {
+    if config.usd_to_cny_rate <= 0.0 {
+        config.usd_to_cny_rate = default_usd_to_cny_rate();
+    }
+
+    if config.proxy_api_keys.is_empty() {
+        if config.proxy_api_key.trim().is_empty() {
+            config.proxy_api_key = generate_proxy_api_key();
+        }
+        config.proxy_api_keys.push(ProxyApiKey {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "默认密钥".to_string(),
+            key: config.proxy_api_key.clone(),
+            enabled: true,
+        });
+    }
+
+    for (index, key) in config.proxy_api_keys.iter_mut().enumerate() {
+        if key.id.trim().is_empty() {
+            key.id = uuid::Uuid::new_v4().to_string();
+        }
+        if key.name.trim().is_empty() {
+            key.name = format!("密钥 {}", index + 1);
+        }
+        if key.key.trim().is_empty() {
+            key.key = generate_proxy_api_key();
+        }
+    }
+
+    if !config.proxy_api_keys.iter().any(|key| key.enabled) {
+        if let Some(first_key) = config.proxy_api_keys.first_mut() {
+            first_key.enabled = true;
+        }
+    }
+
+    if let Some(first_enabled_key) = config
+        .proxy_api_keys
+        .iter()
+        .find(|key| key.enabled && !key.key.trim().is_empty())
+    {
+        config.proxy_api_key = first_enabled_key.key.clone();
+    }
+
+    config
+}
+
 fn read_config_or_default() -> AppConfig {
     let path = config_path();
     if !path.exists() {
@@ -143,12 +226,7 @@ fn read_config_or_default() -> AppConfig {
 }
 
 pub fn load_config() -> AppConfig {
-    let mut config = read_config_or_default();
-    // An empty key disables proxy auth entirely, which lets any local process
-    // or malicious web page use the configured upstream API keys.
-    if config.proxy_api_key.trim().is_empty() {
-        config.proxy_api_key = generate_proxy_api_key();
-    }
+    let config = normalize_config(read_config_or_default());
     save_config(&config).ok();
     config
 }
@@ -184,6 +262,7 @@ mod tests {
         assert_eq!(config.proxy_host, "127.0.0.1");
         assert!(config.auto_start);
         assert_eq!(config.proxy_api_key, "");
+        assert!(config.proxy_api_keys.is_empty());
         assert_eq!(config.providers[0].protocol, "openai");
         assert!(config.providers[0].enabled);
         assert_eq!(config.providers[0].priority, 0);

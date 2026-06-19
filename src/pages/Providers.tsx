@@ -220,6 +220,8 @@ export default function Providers() {
   const [batchResult, setBatchResult] = useState<ProviderTestResult | null>(null);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelFetchResult, setModelFetchResult] = useState<ProviderTestResult | null>(null);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [modelSearch, setModelSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const fetchConfig = async () => {
@@ -240,6 +242,8 @@ export default function Providers() {
     setEditing({ ...emptyProvider });
     setModelInput("");
     setModelFetchResult(null);
+    setFetchedModels([]);
+    setModelSearch("");
     setShowForm(true);
   };
 
@@ -247,6 +251,8 @@ export default function Providers() {
     setEditing({ ...provider });
     setModelInput("");
     setModelFetchResult(null);
+    setFetchedModels([]);
+    setModelSearch("");
     setShowForm(true);
   };
 
@@ -263,6 +269,8 @@ export default function Providers() {
     });
     setModelInput("");
     setModelFetchResult(null);
+    setFetchedModels([]);
+    setModelSearch("");
   };
 
   const handleSave = async () => {
@@ -429,14 +437,8 @@ export default function Providers() {
     try {
       setError(null);
       const models = await invoke<string[]>("fetch_provider_models", { provider: editing });
-      setEditing((current) =>
-        current
-          ? {
-              ...current,
-              models: Array.from(new Set([...current.models, ...models])),
-            }
-          : current,
-      );
+      setFetchedModels(models);
+      setModelSearch("");
       setModelFetchResult({
         success: true,
         message: `已获取 ${models.length} 个模型`,
@@ -468,6 +470,19 @@ export default function Providers() {
       models: editing.models.filter((item) => item !== model),
     });
   };
+
+  const addFetchedModel = (model: string) => {
+    if (!editing) return;
+    setEditing({
+      ...editing,
+      models: Array.from(new Set([...editing.models, model])),
+    });
+  };
+
+  const visibleFetchedModels = fetchedModels
+    .filter((model) => model.toLowerCase().includes(modelSearch.toLowerCase()))
+    .filter((model) => !editing?.models.includes(model))
+    .slice(0, 100);
 
   return (
     <div className="space-y-5">
@@ -513,8 +528,9 @@ export default function Providers() {
       )}
 
       {showForm && editing && (
-        <section className="panel">
-          <div className="flex items-center justify-between border-b border-surface-200 px-4 py-3 dark:border-surface-800">
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-surface-950/50 p-4">
+        <section className="panel mx-auto mt-6 w-full max-w-5xl overflow-hidden">
+          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-surface-200 bg-white px-4 py-3 dark:border-surface-800 dark:bg-surface-900">
             <div className="flex items-center gap-2">
               <Network className="h-4 w-4 text-cyan-600 dark:text-cyan-300" />
               <h2 className="text-sm font-semibold">
@@ -533,6 +549,7 @@ export default function Providers() {
             </button>
           </div>
 
+          <div className="max-h-[calc(100vh-12rem)] overflow-y-auto">
           <div className="grid grid-cols-1 gap-4 p-4 lg:grid-cols-4">
             <label className="space-y-1.5">
               <span className="text-sm font-medium text-surface-700 dark:text-surface-300">预设</span>
@@ -658,6 +675,35 @@ export default function Providers() {
                   {fetchingModels ? "获取中" : "获取模型"}
                 </button>
               </div>
+              {fetchedModels.length > 0 && (
+                <div className="rounded-lg border border-surface-200 bg-surface-50 p-3 dark:border-surface-800 dark:bg-surface-950">
+                  <input
+                    className="input-field"
+                    placeholder={`搜索 ${fetchedModels.length} 个已获取模型`}
+                    value={modelSearch}
+                    onChange={(e) => setModelSearch(e.target.value)}
+                  />
+                  <div className="mt-2 max-h-56 overflow-y-auto rounded-lg border border-surface-200 bg-white dark:border-surface-800 dark:bg-surface-900">
+                    {visibleFetchedModels.map((model) => (
+                      <button
+                        key={model}
+                        className="flex w-full items-center justify-between gap-3 border-b border-surface-100 px-3 py-2 text-left text-sm last:border-0 hover:bg-surface-50 dark:border-surface-800 dark:hover:bg-surface-800"
+                        onClick={() => addFetchedModel(model)}
+                      >
+                        <span className="min-w-0 truncate font-mono text-xs text-surface-700 dark:text-surface-200">
+                          {model}
+                        </span>
+                        <Plus className="h-4 w-4 shrink-0 text-cyan-600 dark:text-cyan-300" />
+                      </button>
+                    ))}
+                    {visibleFetchedModels.length === 0 && (
+                      <div className="px-3 py-4 text-center text-xs text-surface-400">
+                        没有可添加的匹配模型
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
               {editing.models.length > 0 && (
                 <div className="flex flex-wrap gap-2">
                   {editing.models.map((model) => (
@@ -674,8 +720,9 @@ export default function Providers() {
               )}
             </div>
           </div>
+          </div>
 
-          <div className="flex justify-end gap-2 border-t border-surface-200 px-4 py-3 dark:border-surface-800">
+          <div className="sticky bottom-0 flex justify-end gap-2 border-t border-surface-200 bg-white px-4 py-3 dark:border-surface-800 dark:bg-surface-900">
             <button
               className="btn-secondary"
               onClick={() => {
@@ -691,6 +738,7 @@ export default function Providers() {
             </button>
           </div>
         </section>
+        </div>
       )}
 
       <section className="space-y-2">
