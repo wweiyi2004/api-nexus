@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CheckCircle2, Clipboard, KeyRound, Power, Save, ServerCog } from "lucide-react";
+import { CheckCircle2, Clipboard, KeyRound, Power, Save, ServerCog, Tags, Trash2, Plus } from "lucide-react";
+
+interface ModelAlias {
+  alias: string;
+  model: string;
+}
 
 interface AppConfig {
   providers: unknown[];
@@ -8,13 +13,17 @@ interface AppConfig {
   proxy_host: string;
   auto_start: boolean;
   proxy_api_key: string;
+  model_aliases: ModelAlias[];
 }
+
+const emptyAlias: ModelAlias = { alias: "", model: "" };
 
 export default function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [newAlias, setNewAlias] = useState<ModelAlias>(emptyAlias);
 
   useEffect(() => {
     (async () => {
@@ -161,6 +170,99 @@ export default function Settings() {
           <span className={config.proxy_api_key ? "badge badge-success self-center" : "badge badge-warning self-center"}>
             {config.proxy_api_key ? "已启用" : "保存后自动生成"}
           </span>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="flex items-center gap-2 border-b border-surface-200 px-4 py-3 dark:border-surface-800">
+          <Tags className="h-4 w-4 text-violet-600 dark:text-violet-300" />
+          <h2 className="text-sm font-semibold">模型别名</h2>
+          <span className="ml-2 text-xs text-surface-500 dark:text-surface-400">
+            请求中的别名会自动替换为真实模型名
+          </span>
+        </div>
+        <div className="space-y-2 p-4">
+          {config.model_aliases.map((alias, index) => (
+            <div key={index} className="flex items-center gap-2">
+              <input
+                className="input-field"
+                placeholder="别名 (如 fast)"
+                value={alias.alias}
+                onChange={(e) => {
+                  const next = [...config.model_aliases];
+                  next[index] = { ...alias, alias: e.target.value };
+                  setConfig({ ...config, model_aliases: next });
+                }}
+              />
+              <span className="shrink-0 text-sm text-surface-400">→</span>
+              <input
+                className="input-field"
+                placeholder="真实模型名 (如 deepseek-v4-flash)"
+                value={alias.model}
+                onChange={(e) => {
+                  const next = [...config.model_aliases];
+                  next[index] = { ...alias, model: e.target.value };
+                  setConfig({ ...config, model_aliases: next });
+                }}
+              />
+              <button
+                className="btn-icon shrink-0"
+                title="删除"
+                onClick={() => {
+                  const next = config.model_aliases.filter((_, i) => i !== index);
+                  setConfig({ ...config, model_aliases: next });
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+          {config.model_aliases.length === 0 && (
+            <div className="py-2 text-center text-xs text-surface-400">
+              暂无别名。例如：fast → deepseek-v4-flash，sonnet → claude-sonnet-4-20250514
+            </div>
+          )}
+          <div className="flex items-center gap-2 pt-2">
+            <input
+              className="input-field"
+              placeholder="新别名"
+              value={newAlias.alias}
+              onChange={(e) => setNewAlias({ ...newAlias, alias: e.target.value })}
+            />
+            <span className="shrink-0 text-sm text-surface-400">→</span>
+            <input
+              className="input-field"
+              placeholder="真实模型名"
+              value={newAlias.model}
+              onChange={(e) => setNewAlias({ ...newAlias, model: e.target.value })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && newAlias.alias.trim() && newAlias.model.trim()) {
+                  e.preventDefault();
+                  setConfig({
+                    ...config,
+                    model_aliases: [...config.model_aliases, { ...newAlias }],
+                  });
+                  setNewAlias(emptyAlias);
+                }
+              }}
+            />
+            <button
+              className="btn-secondary shrink-0"
+              disabled={!newAlias.alias.trim() || !newAlias.model.trim()}
+              onClick={() => {
+                if (newAlias.alias.trim() && newAlias.model.trim()) {
+                  setConfig({
+                    ...config,
+                    model_aliases: [...config.model_aliases, { ...newAlias }],
+                  });
+                  setNewAlias(emptyAlias);
+                }
+              }}
+            >
+              <Plus className="h-4 w-4" />
+              添加
+            </button>
+          </div>
         </div>
       </section>
 

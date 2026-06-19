@@ -15,6 +15,16 @@ pub struct AppConfig {
     pub auto_start: bool,
     #[serde(default)]
     pub proxy_api_key: String,
+    #[serde(default)]
+    pub model_aliases: Vec<ModelAlias>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAlias {
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +75,7 @@ impl Default for AppConfig {
             proxy_host: default_proxy_host(),
             auto_start: default_auto_start(),
             proxy_api_key: String::new(),
+            model_aliases: Vec::new(),
         }
     }
 }

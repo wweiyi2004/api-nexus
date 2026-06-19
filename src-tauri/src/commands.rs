@@ -13,6 +13,7 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub client: Client,
     pub token_stats: proxy::TokenStatsState,
+    pub request_logs: proxy::RequestLogState,
     pub shutdown_tx: RwLock<Option<broadcast::Sender<()>>>,
     pub server_task: RwLock<Option<JoinHandle<()>>>,
     pub running: Arc<RwLock<bool>>,
@@ -79,7 +80,11 @@ pub async fn update_provider(
     provider: Provider,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.write().await;
-    if let Some(p) = config.providers.iter_mut().find(|p| p.id == provider.id) {
+    let found = config.providers.iter_mut().find(|p| p.id == provider.id);
+    if found.is_none() {
+        return Err(format!("Provider not found: {}", provider.id));
+    }
+    if let Some(p) = found {
         *p = provider;
     }
     config::save_config(&config)?;
@@ -124,6 +129,20 @@ pub async fn reset_token_stats(state: tauri::State<'_, Arc<AppState>>) -> Result
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_request_logs(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<proxy::RequestLogEntry>, String> {
+    let logs = state.request_logs.read().await;
+    Ok(logs.iter().rev().cloned().collect())
+}
+
+#[tauri::command]
+pub async fn clear_request_logs(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.request_logs.write().await.clear();
+    Ok(())
+}
+
 pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, String> {
     let running = *state.running.read().await;
     if running {
@@ -140,7 +159,11 @@ pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, Strin
 
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
 
-    let router = proxy::create_proxy_router_with_stats(config_arc, state.token_stats.clone());
+    let router = proxy::create_proxy_router_with_stats(
+        config_arc,
+        state.token_stats.clone(),
+        state.request_logs.clone(),
+    );
 
     let listener = TcpListener::bind(&addr)
         .await

@@ -3,6 +3,7 @@ import {
   Gauge,
   Moon,
   Network,
+  ScrollText,
   Settings,
   Sun,
   Waypoints,
@@ -14,6 +15,7 @@ const navItems = [
   { to: "/", label: "控制台", icon: Gauge, end: true },
   { to: "/providers", label: "服务商", icon: Network },
   { to: "/models", label: "模型路由", icon: Boxes },
+  { to: "/logs", label: "请求日志", icon: ScrollText },
   { to: "/settings", label: "设置", icon: Settings },
 ];
 

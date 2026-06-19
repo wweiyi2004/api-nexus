@@ -10,6 +10,7 @@ import {
   Database,
   Hash,
   KeyRound,
+  Network,
   Pause,
   Play,
   RefreshCw,
@@ -17,6 +18,19 @@ import {
   ShieldCheck,
   Split,
 } from "lucide-react";
+
+interface RequestLogEntry {
+  timestamp: number;
+  method: string;
+  path: string;
+  model: string;
+  provider: string;
+  status: number;
+  input_tokens: number;
+  output_tokens: number;
+  duration_ms: number;
+  error: string | null;
+}
 
 interface ServerStatus {
   running: boolean;
@@ -63,20 +77,23 @@ export default function Dashboard() {
   const [status, setStatus] = useState<ServerStatus | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [tokenStats, setTokenStats] = useState<TokenStats | null>(null);
+  const [logs, setLogs] = useState<RequestLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
   const fetchData = async () => {
     try {
-      const [serverStatus, appConfig, usageStats] = await Promise.all([
+      const [serverStatus, appConfig, usageStats, requestLogs] = await Promise.all([
         invoke<ServerStatus>("get_server_status"),
         invoke<AppConfig>("get_config"),
         invoke<TokenStats>("get_token_stats"),
+        invoke<RequestLogEntry[]>("get_request_logs"),
       ]);
       setStatus(serverStatus);
       setConfig(appConfig);
       setTokenStats(usageStats);
+      setLogs(requestLogs);
     } catch (e) {
       console.error(e);
     } finally {
@@ -135,6 +152,20 @@ export default function Dashboard() {
     };
   }, [config]);
 
+  const perProvider = useMemo(() => {
+    const map = new Map<string, { input: number; output: number; count: number; errors: number }>();
+    for (const log of logs) {
+      const key = log.provider || "(未知)";
+      const entry = map.get(key) ?? { input: 0, output: 0, count: 0, errors: 0 };
+      entry.input += log.input_tokens;
+      entry.output += log.output_tokens;
+      entry.count += 1;
+      if (log.status >= 400) entry.errors += 1;
+      map.set(key, entry);
+    }
+    return [...map.entries()].sort((a, b) => (b[1].input + b[1].output) - (a[1].input + a[1].output));
+  }, [logs]);
+
   const baseUrl = status?.url ?? `http://${config?.proxy_host ?? "127.0.0.1"}:${config?.proxy_port ?? 11434}`;
 
   if (loading) {
@@ -168,6 +199,10 @@ export default function Dashboard() {
           {error}
         </div>
       )}
+
+      <div className="rounded-lg border border-surface-200 bg-surface-50 px-4 py-2 text-xs text-surface-500 dark:border-surface-800 dark:bg-surface-950 dark:text-surface-400">
+            关闭窗口将最小化到系统托盘，代理继续后台运行。右键托盘图标可显示窗口或退出。
+      </div>
 
       <section className="grid grid-cols-1 gap-3 md:grid-cols-4">
         <div className="panel p-4">
@@ -277,6 +312,45 @@ export default function Dashboard() {
           </div>
         </div>
       </section>
+
+      {perProvider.length > 0 && (
+        <section className="panel p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <Network className="h-4 w-4 text-cyan-600 dark:text-cyan-300" />
+            <h2 className="text-sm font-semibold">服务商用量</h2>
+            <span className="ml-1 text-xs text-surface-500 dark:text-surface-400">
+              基于最近 {logs.length} 条请求日志
+            </span>
+          </div>
+          <div className="space-y-2">
+            {perProvider.map(([name, usage]) => {
+              const total = usage.input + usage.output;
+              const maxTotal = perProvider[0][1].input + perProvider[0][1].output || 1;
+              return (
+                <div key={name} className="rounded-lg bg-surface-50 px-3 py-2 dark:bg-surface-950">
+                  <div className="mb-1.5 flex items-center justify-between text-sm">
+                    <span className="font-medium text-surface-700 dark:text-surface-200">{name}</span>
+                    <span className="flex items-center gap-3 font-mono text-xs text-surface-500 dark:text-surface-400">
+                      <span className="text-emerald-600 dark:text-emerald-300">↓{formatTokens(usage.input)}</span>
+                      <span className="text-sky-600 dark:text-sky-300">↑{formatTokens(usage.output)}</span>
+                      <span>{usage.count} 次</span>
+                      {usage.errors > 0 && (
+                        <span className="text-red-600 dark:text-red-400">{usage.errors} 错误</span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-surface-200 dark:bg-surface-800">
+                    <div
+                      className="h-full rounded-full bg-cyan-500"
+                      style={{ width: `${(total / maxTotal) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <section className="panel">
         <div className="flex items-center justify-between border-b border-surface-200 px-4 py-3 dark:border-surface-800">

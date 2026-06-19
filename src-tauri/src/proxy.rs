@@ -63,25 +63,84 @@ impl TokenStats {
 
 pub type TokenStatsState = Arc<RwLock<TokenStats>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLogEntry {
+    pub timestamp: i64,
+    pub method: String,
+    pub path: String,
+    pub model: String,
+    pub provider: String,
+    pub status: u16,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+pub type RequestLogState = Arc<RwLock<std::collections::VecDeque<RequestLogEntry>>>;
+
+const MAX_LOG_ENTRIES: usize = 100;
+
+pub async fn push_request_log(state: &RequestLogState, entry: RequestLogEntry) {
+    let mut logs = state.write().await;
+    if logs.len() >= MAX_LOG_ENTRIES {
+        logs.pop_front();
+    }
+    logs.push_back(entry);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_request(
+    logs: &RequestLogState,
+    method: &str,
+    path: &str,
+    model: &str,
+    provider: &str,
+    status: u16,
+    usage: TokenUsage,
+    started: std::time::Instant,
+    error: Option<String>,
+) {
+    let entry = RequestLogEntry {
+        timestamp: chrono::Utc::now().timestamp(),
+        method: method.to_string(),
+        path: path.to_string(),
+        model: model.to_string(),
+        provider: provider.to_string(),
+        status,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        duration_ms: started.elapsed().as_millis() as u64,
+        error,
+    };
+    push_request_log(logs, entry).await;
+}
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<RwLock<AppConfig>>,
     pub client: Client,
     pub token_stats: TokenStatsState,
+    pub request_logs: RequestLogState,
 }
 
 #[cfg(test)]
 pub fn create_proxy_router(config: Arc<RwLock<AppConfig>>) -> Router {
-    create_proxy_router_with_stats(config, Arc::new(RwLock::new(TokenStats::default())))
+    create_proxy_router_with_stats(
+        config,
+        Arc::new(RwLock::new(TokenStats::default())),
+        Arc::new(RwLock::new(std::collections::VecDeque::new())),
+    )
 }
 
 pub fn create_proxy_router_with_stats(
     config: Arc<RwLock<AppConfig>>,
     token_stats: TokenStatsState,
+    request_logs: RequestLogState,
 ) -> Router {
     let state = ProxyState {
         config,
         token_stats,
+        request_logs,
         // No total request timeout: it would cut off long streaming responses.
         // Stalls are guarded by the read timeout, which resets on every chunk.
         client: Client::builder()
@@ -200,7 +259,19 @@ fn incoming_api_key(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn is_anthropic_client(headers: &HeaderMap) -> bool {
-    headers.contains_key("anthropic-version") || headers.contains_key("x-api-key")
+    headers.contains_key("anthropic-version")
+}
+
+fn resolve_model_alias<'a>(config: &'a AppConfig, model: &'a str) -> &'a str {
+    if model.is_empty() {
+        return model;
+    }
+    for alias in &config.model_aliases {
+        if alias.alias.eq_ignore_ascii_case(model) {
+            return &alias.model;
+        }
+    }
+    model
 }
 
 fn is_anthropic_provider(provider: &Provider) -> bool {
@@ -402,64 +473,56 @@ async fn passthrough_response(
     token_stats: TokenStatsState,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
 
-    if is_stream {
-        let stream = async_stream::stream! {
-            let mut upstream = resp.bytes_stream();
-            let mut buffer = String::new();
-            let mut usage = TokenUsage::default();
+    let stream = async_stream::stream! {
+        let mut upstream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut usage = TokenUsage::default();
+        let mut accumulated = Vec::new();
 
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(bytes) => {
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if is_stream {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
                         while let Some(pos) = buffer.find("\n\n") {
                             let frame = buffer[..pos].to_string();
                             buffer = buffer[pos + 2..].to_string();
                             usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
                         }
+                    } else {
+                        accumulated.extend_from_slice(&bytes);
+                    }
 
-                        yield Ok::<Bytes, io::Error>(bytes);
-                    }
-                    Err(err) => {
-                        yield Err(io::Error::other(err.to_string()));
-                        return;
-                    }
+                    yield Ok::<Bytes, io::Error>(bytes);
+                }
+                Err(err) => {
+                    yield Err(io::Error::other(err.to_string()));
+                    return;
                 }
             }
+        }
 
+        if is_stream {
             if !buffer.trim().is_empty() {
                 usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
             }
-
             record_token_usage(&token_stats, usage).await;
-        };
-
-        return Response::builder()
-            .status(status)
-            .header(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream"),
-            )
-            .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|err| {
-                bad_gateway(format!("Failed to build stream response: {}", err))
-            });
-    }
-
-    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
-    let bytes = match resp.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => return bad_gateway(format!("Failed to read upstream response: {}", err)),
+        } else if let Ok(body_json) = serde_json::from_slice::<Value>(&accumulated) {
+            record_token_usage(&token_stats, extract_token_usage(&body_json)).await;
+        }
     };
 
-    if let Ok(body_json) = serde_json::from_slice::<Value>(&bytes) {
-        record_token_usage(&token_stats, extract_token_usage(&body_json)).await;
-    }
-
     let mut builder = Response::builder().status(status);
-    if let Some(content_type) = content_type {
+    if is_stream {
+        builder = builder
+            .header(
+                header::CONTENT_TYPE,
+                content_type.unwrap_or_else(|| HeaderValue::from_static("text/event-stream")),
+            )
+            .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    } else if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     } else {
         builder = builder.header(
@@ -469,8 +532,8 @@ async fn passthrough_response(
     }
 
     builder
-        .body(Body::from(bytes))
-        .unwrap_or_else(|err| bad_gateway(format!("Failed to build upstream response: {}", err)))
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|err| bad_gateway(format!("Failed to build stream response: {}", err)))
 }
 
 fn copy_optional_header(
@@ -644,16 +707,24 @@ fn openai_to_anthropic_request(openai: &Value) -> Result<Value, String> {
 
     for field in ["temperature", "top_p", "top_k", "stream"] {
         if let Some(value) = openai.get(field) {
-            request[field] = value.clone();
+            if !value.is_null() {
+                request[field] = value.clone();
+            }
         }
     }
 
     if let Some(stop) = openai.get("stop") {
-        request["stop_sequences"] = match stop {
-            Value::String(stop) => json!([stop]),
-            Value::Array(_) => stop.clone(),
-            _ => Value::Null,
-        };
+        if !stop.is_null() {
+            match stop {
+                Value::String(stop) => {
+                    request["stop_sequences"] = json!([stop]);
+                }
+                Value::Array(_) => {
+                    request["stop_sequences"] = stop.clone();
+                }
+                _ => {}
+            }
+        }
     }
 
     if let Some(tools) = openai.get("tools").and_then(Value::as_array) {
@@ -676,23 +747,29 @@ fn openai_to_anthropic_request(openai: &Value) -> Result<Value, String> {
     }
 
     if let Some(tool_choice) = openai.get("tool_choice") {
-        request["tool_choice"] = match tool_choice {
-            Value::String(choice) if choice == "required" => json!({"type": "any"}),
-            Value::String(choice) if choice == "auto" => json!({"type": "auto"}),
-            Value::String(choice) if choice == "none" => Value::Null,
-            Value::Object(_) => {
-                if let Some(name) = tool_choice
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(Value::as_str)
-                {
-                    json!({"type": "tool", "name": name})
-                } else {
-                    Value::Null
+        if !tool_choice.is_null() {
+            match tool_choice {
+                Value::String(choice) if choice == "required" => {
+                    request["tool_choice"] = json!({"type": "any"});
                 }
+                Value::String(choice) if choice == "auto" => {
+                    request["tool_choice"] = json!({"type": "auto"});
+                }
+                Value::String(choice) if choice == "none" => {
+                    // Anthropic has no "none" tool_choice; omit the field.
+                }
+                Value::Object(_) => {
+                    if let Some(name) = tool_choice
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        request["tool_choice"] = json!({"type": "tool", "name": name});
+                    }
+                }
+                _ => {}
             }
-            _ => Value::Null,
-        };
+        }
     }
 
     Ok(request)
@@ -853,12 +930,16 @@ fn anthropic_to_openai_chat_request(anthropic: &Value) -> Result<Value, String> 
 
     for field in ["temperature", "top_p", "stream"] {
         if let Some(value) = anthropic.get(field) {
-            request[field] = value.clone();
+            if !value.is_null() {
+                request[field] = value.clone();
+            }
         }
     }
 
     if let Some(stop_sequences) = anthropic.get("stop_sequences") {
-        request["stop"] = stop_sequences.clone();
+        if !stop_sequences.is_null() {
+            request["stop"] = stop_sequences.clone();
+        }
     }
 
     if let Some(tools) = anthropic.get("tools").and_then(Value::as_array) {
@@ -883,19 +964,23 @@ fn anthropic_to_openai_chat_request(anthropic: &Value) -> Result<Value, String> 
     }
 
     if let Some(tool_choice) = anthropic.get("tool_choice") {
-        request["tool_choice"] = match tool_choice {
-            Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
-                Some("auto") => Value::String("auto".to_string()),
-                Some("any") => Value::String("required".to_string()),
-                Some("tool") => choice
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(|name| json!({"type": "function", "function": {"name": name}}))
-                    .unwrap_or(Value::Null),
-                _ => Value::Null,
-            },
-            _ => Value::Null,
-        };
+        if !tool_choice.is_null() {
+            let mapped = match tool_choice {
+                Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+                    Some("auto") => Some(Value::String("auto".to_string())),
+                    Some("any") => Some(Value::String("required".to_string())),
+                    Some("tool") => choice
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|name| json!({"type": "function", "function": {"name": name}})),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(value) = mapped {
+                request["tool_choice"] = value;
+            }
+        }
     }
 
     Ok(request)
@@ -1323,7 +1408,7 @@ async fn openai_stream_to_anthropic_response(
                 "stop_reason": openai_finish_reason_to_anthropic(finish_reason.as_deref()),
                 "stop_sequence": null
             },
-            "usage": {"output_tokens": 0}
+            "usage": {"output_tokens": usage.output_tokens}
         }))));
         yield Ok::<Bytes, io::Error>(Bytes::from(anthropic_sse_frame("message_stop", json!({
             "type": "message_stop"
@@ -1496,14 +1581,14 @@ async fn anthropic_handler(
     }
 
     let request_path = uri.path().to_string();
+    let started = std::time::Instant::now();
 
     let config = state.config.read().await;
     if let Some(response) = proxy_api_key_error(&headers, &config) {
         return response;
     }
-    drop(config);
 
-    let body_json: Value = match serde_json::from_slice(&body) {
+    let mut body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -1520,11 +1605,17 @@ async fn anthropic_handler(
         }
     };
 
-    let model = body_json
+    let raw_model = body_json
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
+    let resolved_model = resolve_model_alias(&config, raw_model).to_string();
+    drop(config);
+
+    let model = resolved_model.clone();
+    if model != raw_model {
+        body_json["model"] = Value::String(model.clone());
+    }
     let is_stream = body_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -1542,6 +1633,18 @@ async fn anthropic_handler(
     providers.sort_by_key(|provider| provider.priority);
 
     if providers.is_empty() {
+        log_request(
+            &state.request_logs,
+            "POST",
+            &request_path,
+            &model,
+            "",
+            404,
+            TokenUsage::default(),
+            started,
+            Some(format!("No provider found for model: {}", model)),
+        )
+        .await;
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1571,6 +1674,18 @@ async fn anthropic_handler(
                         continue;
                     }
 
+                    log_request(
+                        &state.request_logs,
+                        "POST",
+                        &request_path,
+                        &model,
+                        &provider.name,
+                        200,
+                        TokenUsage::default(),
+                        started,
+                        None,
+                    )
+                    .await;
                     return passthrough_response(resp, is_stream, state.token_stats.clone()).await;
                 }
                 Err(err) => {
@@ -1581,6 +1696,18 @@ async fn anthropic_handler(
         }
 
         if request_path == "/v1/messages/count_tokens" {
+            log_request(
+                &state.request_logs,
+                "POST",
+                &request_path,
+                &model,
+                &provider.name,
+                200,
+                TokenUsage::default(),
+                started,
+                None,
+            )
+            .await;
             return Json(json!({
                 "input_tokens": estimate_anthropic_tokens(&body_json)
             }))
@@ -1622,6 +1749,18 @@ async fn anthropic_handler(
                 }
 
                 if is_stream {
+                    log_request(
+                        &state.request_logs,
+                        "POST",
+                        &request_path,
+                        &model,
+                        &provider.name,
+                        200,
+                        TokenUsage::default(),
+                        started,
+                        None,
+                    )
+                    .await;
                     return openai_stream_to_anthropic_response(
                         resp,
                         model.clone(),
@@ -1632,9 +1771,18 @@ async fn anthropic_handler(
 
                 match resp.json::<Value>().await {
                     Ok(openai_response) => {
-                        record_token_usage(
-                            &state.token_stats,
-                            extract_token_usage(&openai_response),
+                        let usage = extract_token_usage(&openai_response);
+                        record_token_usage(&state.token_stats, usage).await;
+                        log_request(
+                            &state.request_logs,
+                            "POST",
+                            &request_path,
+                            &model,
+                            &provider.name,
+                            200,
+                            usage,
+                            started,
+                            None,
                         )
                         .await;
                         return Json(openai_to_anthropic_response(openai_response, &model))
@@ -1655,6 +1803,19 @@ async fn anthropic_handler(
             }
         }
     }
+
+    log_request(
+        &state.request_logs,
+        "POST",
+        &request_path,
+        &model,
+        "",
+        502,
+        TokenUsage::default(),
+        started,
+        Some(errors.join("; ")),
+    )
+    .await;
 
     (
         StatusCode::BAD_GATEWAY,
@@ -1694,14 +1855,14 @@ async fn proxy_handler(
     }
 
     let request_path = uri.path().to_string();
+    let started = std::time::Instant::now();
 
     let config = state.config.read().await;
     if let Some(response) = proxy_api_key_error(&headers, &config) {
         return response;
     }
-    drop(config);
 
-    let body_json: Value = match serde_json::from_slice(&body) {
+    let mut body_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -1712,11 +1873,18 @@ async fn proxy_handler(
         }
     };
 
-    let model = body_json
+    let raw_model = body_json
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+    let resolved_model = resolve_model_alias(&config, &raw_model).to_string();
+    drop(config);
+
+    let model = resolved_model.clone();
+    if model != raw_model {
+        body_json["model"] = Value::String(model.clone());
+    }
 
     let is_stream = body_json
         .get("stream")
@@ -1738,6 +1906,18 @@ async fn proxy_handler(
     providers.sort_by_key(|p| p.priority);
 
     if providers.is_empty() {
+        log_request(
+            &state.request_logs,
+            "POST",
+            &request_path,
+            &model,
+            "",
+            404,
+            TokenUsage::default(),
+            started,
+            Some(format!("No provider found for model: {}", model)),
+        )
+        .await;
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1775,6 +1955,18 @@ async fn proxy_handler(
                     }
 
                     if is_stream {
+                        log_request(
+                            &state.request_logs,
+                            "POST",
+                            &request_path,
+                            &model,
+                            &provider.name,
+                            200,
+                            TokenUsage::default(),
+                            started,
+                            None,
+                        )
+                        .await;
                         return anthropic_stream_to_openai_response(
                             resp,
                             model.clone(),
@@ -1785,9 +1977,18 @@ async fn proxy_handler(
 
                     match resp.json::<Value>().await {
                         Ok(anthropic_response) => {
-                            record_token_usage(
-                                &state.token_stats,
-                                extract_token_usage(&anthropic_response),
+                            let usage = extract_token_usage(&anthropic_response);
+                            record_token_usage(&state.token_stats, usage).await;
+                            log_request(
+                                &state.request_logs,
+                                "POST",
+                                &request_path,
+                                &model,
+                                &provider.name,
+                                200,
+                                usage,
+                                started,
+                                None,
                             )
                             .await;
                             return Json(anthropic_to_openai_response(anthropic_response, &model))
@@ -1830,6 +2031,18 @@ async fn proxy_handler(
                     continue;
                 }
 
+                log_request(
+                    &state.request_logs,
+                    "POST",
+                    &request_path,
+                    &model,
+                    &provider.name,
+                    200,
+                    TokenUsage::default(),
+                    started,
+                    None,
+                )
+                .await;
                 return passthrough_response(resp, is_stream, state.token_stats.clone()).await;
             }
             Err(e) => {
@@ -1838,6 +2051,19 @@ async fn proxy_handler(
             }
         }
     }
+
+    log_request(
+        &state.request_logs,
+        "POST",
+        &request_path,
+        &model,
+        "",
+        502,
+        TokenUsage::default(),
+        started,
+        Some(errors.join("; ")),
+    )
+    .await;
 
     (
         StatusCode::BAD_GATEWAY,
@@ -1949,6 +2175,13 @@ mod tests {
                 "/v1/chat/completions"
             ),
             "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        );
+        assert_eq!(
+            openai_upstream_url(
+                "https://ark.cn-beijing.volces.com/api/coding",
+                "/v1/chat/completions"
+            ),
+            "https://ark.cn-beijing.volces.com/api/coding/chat/completions"
         );
         assert_eq!(
             openai_upstream_url("https://open.bigmodel.cn/api/paas/v4/", "/v1/models"),
@@ -2078,7 +2311,7 @@ mod tests {
             providers: vec![provider(format!("http://{}", upstream_addr), 0)],
             ..Default::default()
         };
-        let proxy = create_proxy_router_with_stats(Arc::new(RwLock::new(config)), stats.clone());
+        let proxy = create_proxy_router_with_stats(Arc::new(RwLock::new(config)), stats.clone(), Arc::new(RwLock::new(std::collections::VecDeque::new())));
         let (proxy_addr, proxy_task) = spawn_router(proxy).await;
 
         let response = reqwest::Client::new()
@@ -2497,5 +2730,56 @@ mod tests {
             .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
 
         proxy_task.abort();
+    }
+
+    #[test]
+    fn openai_to_anthropic_omits_null_optional_fields() {
+        let request = openai_to_anthropic_request(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "temperature": null,
+            "stop": null,
+            "tool_choice": "none"
+        }))
+        .unwrap();
+
+        assert!(
+            request.get("temperature").is_none() || !request["temperature"].is_null()
+        );
+        assert!(
+            request.get("stop_sequences").is_none(),
+            "stop_sequences should be omitted when stop is null, got: {:?}",
+            request.get("stop_sequences")
+        );
+        assert!(
+            request.get("tool_choice").is_none(),
+            "tool_choice should be omitted when 'none', got: {:?}",
+            request.get("tool_choice")
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_omits_null_optional_fields() {
+        let request = anthropic_to_openai_chat_request(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "temperature": null,
+            "stop_sequences": null,
+            "tool_choice": null
+        }))
+        .unwrap();
+
+        assert!(
+            request.get("stop").is_none(),
+            "stop should be omitted when stop_sequences is null, got: {:?}",
+            request.get("stop")
+        );
+        assert!(
+            request.get("tool_choice").is_none(),
+            "tool_choice should be omitted when null, got: {:?}",
+            request.get("tool_choice")
+        );
     }
 }

@@ -140,6 +140,14 @@ const providerPresets: Array<{
     models: [],
   },
   {
+    id: "volcengine-coding",
+    label: "火山方舟 · Coding 订阅",
+    name: "火山方舟 Coding",
+    protocol: "openai",
+    base_url: "https://ark.cn-beijing.volces.com/api/coding",
+    models: [],
+  },
+  {
     id: "zhipu",
     label: "智谱 GLM",
     name: "智谱 GLM",

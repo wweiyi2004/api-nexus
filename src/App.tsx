@@ -5,6 +5,7 @@ import Dashboard from "./pages/Dashboard";
 import Providers from "./pages/Providers";
 import Models from "./pages/Models";
 import Settings from "./pages/Settings";
+import Logs from "./pages/Logs";
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
             <Route index element={<Dashboard />} />
             <Route path="providers" element={<Providers />} />
             <Route path="models" element={<Models />} />
+            <Route path="logs" element={<Logs />} />
             <Route path="settings" element={<Settings />} />
           </Route>
         </Routes>
