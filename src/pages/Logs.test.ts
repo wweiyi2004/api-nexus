@@ -8,21 +8,28 @@ import {
 } from "./Logs";
 
 const price: ModelPrice = {
+  provider_id: "",
   model: "test-model",
   input_usd_per_million: 10,
   output_usd_per_million: 20,
   cached_usd_per_million: 2,
   cache_read_usd_per_million: 2,
   cache_write_usd_per_million: 12,
+  source_url: "",
+  source_note: "",
+  updated_at: "",
+  automatic: false,
 };
 
 function log(overrides: Partial<RequestLogEntry> = {}): RequestLogEntry {
   return {
+    id: 1,
     timestamp: Math.floor(Date.now() / 1000) - 60,
     method: "POST",
     path: "/v1/messages",
     model: "test-model",
     provider: "provider",
+    provider_id: "provider-id",
     api_key_name: "client-a",
     status: 200,
     input_tokens: 1_000_000,

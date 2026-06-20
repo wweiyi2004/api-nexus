@@ -589,17 +589,6 @@ export default function Providers() {
               </select>
             </label>
             <label className="space-y-1.5">
-              <span className="text-sm font-medium text-surface-700 dark:text-surface-300">优先级</span>
-              <input
-                className="input-field"
-                type="number"
-                value={editing.priority}
-                onChange={(e) =>
-                  setEditing({ ...editing, priority: parseInt(e.target.value, 10) || 0 })
-                }
-              />
-            </label>
-            <label className="space-y-1.5">
               <span className="text-sm font-medium text-surface-700 dark:text-surface-300">状态</span>
               <button
                 className="btn-secondary w-full"
@@ -763,7 +752,6 @@ export default function Providers() {
                       {provider.name || "未命名服务商"}
                     </h3>
                     <span className="badge badge-info">{protocolLabel(provider.protocol)}</span>
-                    <span className="badge badge-neutral">P{provider.priority}</span>
                   </div>
                   <p className="mt-1 truncate font-mono text-xs text-surface-500 dark:text-surface-400">
                     {provider.base_url || "未配置基础地址"}

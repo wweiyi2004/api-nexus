@@ -92,6 +92,7 @@ async fn log_request(
     path: &str,
     model: &str,
     provider: &str,
+    provider_id: &str,
     api_key_name: &str,
     status: u16,
     usage: TokenUsage,
@@ -99,11 +100,13 @@ async fn log_request(
     error: Option<String>,
 ) {
     let entry = RequestLogEntry {
+        id: 0,
         timestamp: chrono::Utc::now().timestamp(),
         method: method.to_string(),
         path: path.to_string(),
         model: model.to_string(),
         provider: provider.to_string(),
+        provider_id: provider_id.to_string(),
         api_key_name: api_key_name.to_string(),
         status,
         input_tokens: usage.input_tokens,
@@ -123,6 +126,7 @@ struct RequestLogContext {
     path: String,
     model: String,
     provider: String,
+    provider_id: String,
     api_key_name: String,
     status: u16,
     started: std::time::Instant,
@@ -314,6 +318,32 @@ fn is_anthropic_provider(provider: &Provider) -> bool {
 
 fn provider_matches_model(provider: &Provider, model: &str) -> bool {
     provider.enabled && provider.models.iter().any(|m| m == model)
+}
+
+fn sort_providers_for_model(config: &AppConfig, model: &str, providers: &mut [Provider]) {
+    let route_positions: BTreeMap<&str, usize> = config
+        .model_routes
+        .iter()
+        .find(|route| route.model == model)
+        .map(|route| {
+            route
+                .provider_ids
+                .iter()
+                .enumerate()
+                .map(|(index, provider_id)| (provider_id.as_str(), index))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    providers.sort_by_key(|provider| {
+        (
+            route_positions
+                .get(provider.id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            provider.priority,
+        )
+    });
 }
 
 fn base_url_has_path(base_url: &str) -> bool {
@@ -588,6 +618,7 @@ async fn passthrough_response(
                 &log_context.path,
                 &log_context.model,
                 &log_context.provider,
+                &log_context.provider_id,
                 &log_context.api_key_name,
                 log_context.status,
                 usage,
@@ -604,6 +635,7 @@ async fn passthrough_response(
                 &log_context.path,
                 &log_context.model,
                 &log_context.provider,
+                &log_context.provider_id,
                 &log_context.api_key_name,
                 log_context.status,
                 usage,
@@ -618,6 +650,7 @@ async fn passthrough_response(
                 &log_context.path,
                 &log_context.model,
                 &log_context.provider,
+                &log_context.provider_id,
                 &log_context.api_key_name,
                 log_context.status,
                 TokenUsage::default(),
@@ -1537,6 +1570,7 @@ async fn openai_stream_to_anthropic_response(
             &log_context.path,
             &log_context.model,
             &log_context.provider,
+            &log_context.provider_id,
             &log_context.api_key_name,
             log_context.status,
             usage,
@@ -1680,6 +1714,7 @@ async fn anthropic_stream_to_openai_response(
             &log_context.path,
             &log_context.model,
             &log_context.provider,
+            &log_context.provider_id,
             &log_context.api_key_name,
             log_context.status,
             usage,
@@ -1770,9 +1805,8 @@ async fn anthropic_handler(
         .filter(|provider| provider_matches_model(provider, &model))
         .cloned()
         .collect();
+    sort_providers_for_model(&config, &model, &mut providers);
     drop(config);
-
-    providers.sort_by_key(|provider| provider.priority);
 
     if providers.is_empty() {
         log_request(
@@ -1780,6 +1814,7 @@ async fn anthropic_handler(
             "POST",
             &request_path,
             &model,
+            "",
             "",
             &api_key_name,
             404,
@@ -1828,6 +1863,7 @@ async fn anthropic_handler(
                             path: request_path.clone(),
                             model: model.clone(),
                             provider: provider.name.clone(),
+                            provider_id: provider.id.clone(),
                             api_key_name: api_key_name.clone(),
                             status,
                             started,
@@ -1849,6 +1885,7 @@ async fn anthropic_handler(
                 &request_path,
                 &model,
                 &provider.name,
+                &provider.id,
                 &api_key_name,
                 200,
                 TokenUsage::default(),
@@ -1907,6 +1944,7 @@ async fn anthropic_handler(
                             path: request_path.clone(),
                             model: model.clone(),
                             provider: provider.name.clone(),
+                            provider_id: provider.id.clone(),
                             api_key_name: api_key_name.clone(),
                             status: 200,
                             started,
@@ -1925,6 +1963,7 @@ async fn anthropic_handler(
                             &request_path,
                             &model,
                             &provider.name,
+                            &provider.id,
                             &api_key_name,
                             200,
                             usage,
@@ -1956,6 +1995,7 @@ async fn anthropic_handler(
         "POST",
         &request_path,
         &model,
+        "",
         "",
         &api_key_name,
         502,
@@ -2050,9 +2090,8 @@ async fn proxy_handler(
         })
         .cloned()
         .collect();
+    sort_providers_for_model(&config, &model, &mut providers);
     drop(config);
-
-    providers.sort_by_key(|p| p.priority);
 
     if providers.is_empty() {
         log_request(
@@ -2060,6 +2099,7 @@ async fn proxy_handler(
             "POST",
             &request_path,
             &model,
+            "",
             "",
             &api_key_name,
             404,
@@ -2115,6 +2155,7 @@ async fn proxy_handler(
                                 path: request_path.clone(),
                                 model: model.clone(),
                                 provider: provider.name.clone(),
+                                provider_id: provider.id.clone(),
                                 api_key_name: api_key_name.clone(),
                                 status: 200,
                                 started,
@@ -2133,6 +2174,7 @@ async fn proxy_handler(
                                 &request_path,
                                 &model,
                                 &provider.name,
+                                &provider.id,
                                 &api_key_name,
                                 200,
                                 usage,
@@ -2191,6 +2233,7 @@ async fn proxy_handler(
                         path: request_path.clone(),
                         model: model.clone(),
                         provider: provider.name.clone(),
+                        provider_id: provider.id.clone(),
                         api_key_name: api_key_name.clone(),
                         status,
                         started,
@@ -2210,6 +2253,7 @@ async fn proxy_handler(
         "POST",
         &request_path,
         &model,
+        "",
         "",
         &api_key_name,
         502,
@@ -2235,7 +2279,7 @@ async fn proxy_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Provider;
+    use crate::config::{ModelRoute, Provider};
     use axum::routing::post;
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
@@ -2268,6 +2312,54 @@ mod tests {
             protocol: "anthropic".to_string(),
             ..provider(base_url, priority)
         }
+    }
+
+    #[test]
+    fn provider_order_is_independent_for_each_model() {
+        let first = Provider {
+            id: "first".to_string(),
+            models: vec!["model-a".to_string(), "model-b".to_string()],
+            ..provider("https://first.example".to_string(), 0)
+        };
+        let second = Provider {
+            id: "second".to_string(),
+            models: vec!["model-a".to_string(), "model-b".to_string()],
+            ..provider("https://second.example".to_string(), 1)
+        };
+        let config = AppConfig {
+            providers: vec![first.clone(), second.clone()],
+            model_routes: vec![
+                ModelRoute {
+                    model: "model-a".to_string(),
+                    provider_ids: vec!["second".to_string(), "first".to_string()],
+                },
+                ModelRoute {
+                    model: "model-b".to_string(),
+                    provider_ids: vec!["first".to_string(), "second".to_string()],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut model_a = vec![first.clone(), second.clone()];
+        sort_providers_for_model(&config, "model-a", &mut model_a);
+        assert_eq!(
+            model_a
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+
+        let mut model_b = vec![first, second];
+        sort_providers_for_model(&config, "model-b", &mut model_b);
+        assert_eq!(
+            model_b
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
     }
 
     #[test]

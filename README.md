@@ -7,11 +7,12 @@ API Nexus is a local API gateway for routing AI model requests through OpenAI-co
 - OpenAI-compatible entrypoint: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
 - Anthropic-compatible entrypoint: `/v1/messages`, `/v1/messages/count_tokens`
 - Bidirectional protocol conversion between OpenAI chat completions and Anthropic messages
-- Provider priority routing and fallback
+- Per-model provider priority routing with drag-and-drop ordering and fallback
 - Provider presets for common model vendors
 - Multiple named client API keys with per-key request attribution
 - Persistent SQLite request logs with retention controls and CSV export
-- Token usage trends with separate cache-read/cache-write pricing and USD/CNY cost estimates
+- Responsive line-chart usage trends and compact expandable request logs
+- Provider-specific model pricing with verified preset prices, cache pricing, and USD/CNY cost estimates
 - Windows DPAPI protection for upstream and client API keys
 - Signed in-app updates from GitHub Releases
 - Local proxy API key protection and background system-tray operation

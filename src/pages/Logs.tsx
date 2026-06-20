@@ -2,9 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
-  ArrowDown,
-  ArrowUp,
   BarChart3,
+  ChevronDown,
   Clock3,
   Download,
   Gauge,
@@ -16,11 +15,13 @@ import {
 } from "lucide-react";
 
 export interface RequestLogEntry {
+  id: number;
   timestamp: number;
   method: string;
   path: string;
   model: string;
   provider: string;
+  provider_id: string;
   api_key_name: string;
   status: number;
   input_tokens: number;
@@ -44,12 +45,17 @@ interface Provider {
 }
 
 export interface ModelPrice {
+  provider_id: string;
   model: string;
   input_usd_per_million: number;
   output_usd_per_million: number;
   cached_usd_per_million: number;
   cache_read_usd_per_million: number;
   cache_write_usd_per_million: number;
+  source_url: string;
+  source_note: string;
+  updated_at: string;
+  automatic: boolean;
 }
 
 interface AppConfig {
@@ -317,6 +323,7 @@ export default function Logs() {
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [expandedLog, setExpandedLog] = useState<string | null>(null);
   const pageSize = 20;
 
   const fetchLogs = async () => {
@@ -369,16 +376,32 @@ export default function Logs() {
   const providerOptions = Array.from(new Set(logs.map((log) => log.provider).filter(Boolean))).sort();
   const keyOptions = Array.from(new Set(logs.map((log) => log.api_key_name).filter(Boolean))).sort();
 
-  const priceMap = new Map(
+  const wildcardPriceMap = new Map(
     (config?.model_prices ?? [])
-      .filter((price) => price.model.trim())
+      .filter((price) => !price.provider_id?.trim() && price.model.trim())
       .map((price) => [price.model.trim().toLowerCase(), price]),
   );
+  const providerPriceMap = new Map(
+    (config?.model_prices ?? [])
+      .filter((price) => price.provider_id?.trim() && price.model.trim())
+      .map((price) => [`${price.provider_id}:${price.model.trim().toLowerCase()}`, price]),
+  );
   const providerProtocolMap = new Map<string, Provider["protocol"]>();
+  const providerIdMap = new Map<string, string>();
   for (const provider of config?.providers ?? []) {
     providerProtocolMap.set(provider.id, provider.protocol);
     providerProtocolMap.set(provider.name, provider.protocol);
+    providerIdMap.set(provider.id, provider.id);
+    providerIdMap.set(provider.name, provider.id);
   }
+  const providerIdFor = (log: RequestLogEntry) =>
+    log.provider_id?.trim() || providerIdMap.get(log.provider);
+  const protocolFor = (log: RequestLogEntry) => {
+    const providerId = providerIdFor(log);
+    return providerId
+      ? providerProtocolMap.get(providerId) ?? providerProtocolMap.get(log.provider)
+      : providerProtocolMap.get(log.provider);
+  };
 
   const filteredLogs = logs.filter((log) => {
     if (modelFilter !== "all" && log.model !== modelFilter) return false;
@@ -402,18 +425,21 @@ export default function Logs() {
   });
 
   const costFor = (log: RequestLogEntry) => {
-    const price = priceMap.get(log.model.trim().toLowerCase());
+    const model = log.model.trim().toLowerCase();
+    const providerId = providerIdFor(log);
+    const price = (providerId ? providerPriceMap.get(`${providerId}:${model}`) : undefined)
+      ?? wildcardPriceMap.get(model);
     if (!price) return null;
     return calculateLogCost(
       log,
       price,
-      providerProtocolMap.get(log.provider),
+      protocolFor(log),
       config?.usd_to_cny_rate ?? 7.2,
     );
   };
 
   const tokenCountFor = (log: RequestLogEntry) =>
-    countLogTokens(log, providerProtocolMap.get(log.provider));
+    countLogTokens(log, protocolFor(log));
 
   const totals = filteredLogs.reduce(
     (acc, log) => {
@@ -429,6 +455,21 @@ export default function Logs() {
   );
   const trendData = buildTrendData(filteredLogs, timeFilter, trendMetric, costFor, tokenCountFor);
   const rankingMax = Math.max(...trendData.rankings.map((item) => item.value), 1);
+  const chartWidth = 720;
+  const chartHeight = 220;
+  const chartPadding = { left: 42, right: 16, top: 16, bottom: 34 };
+  const chartInnerWidth = chartWidth - chartPadding.left - chartPadding.right;
+  const chartInnerHeight = chartHeight - chartPadding.top - chartPadding.bottom;
+  const chartX = (index: number) =>
+    chartPadding.left +
+    (trendData.buckets.length <= 1
+      ? chartInnerWidth / 2
+      : (index / (trendData.buckets.length - 1)) * chartInnerWidth);
+  const chartY = (value: number) =>
+    chartPadding.top +
+    chartInnerHeight -
+    (value / Math.max(1, trendData.maxBucketValue)) * chartInnerHeight;
+  const chartLabelStep = Math.max(1, Math.ceil(trendData.buckets.length / 6));
 
   const pageCount = Math.max(1, Math.ceil(filteredLogs.length / pageSize));
   const safePage = Math.min(page, pageCount);
@@ -614,54 +655,89 @@ export default function Logs() {
               </div>
             ) : (
               <>
-                <div className="mt-4 overflow-x-auto">
-                  <div className="min-w-[42rem]">
-                    <div className="flex h-48 items-end gap-1 border-b border-surface-200 pb-2 dark:border-surface-800">
-                      {trendData.buckets.map((bucket, index) => (
-                        <div key={`${bucket.label}-${index}`} className="group flex h-full min-w-10 flex-1 flex-col justify-end">
-                          <div className="relative flex min-h-0 flex-1 items-end justify-center">
-                            <div
-                              className="w-full max-w-8 overflow-hidden rounded-t-md bg-surface-100 ring-1 ring-surface-200 dark:bg-surface-800 dark:ring-surface-700"
-                              style={{
-                                height: `${bucket.total > 0 ? Math.max(4, (bucket.total / trendData.maxBucketValue) * 100) : 4}%`,
-                                opacity: bucket.total > 0 ? 1 : 0.45,
-                              }}
-                              title={`${bucket.rangeLabel}: ${formatTrendValue(bucket.total, trendMetric)}`}
+                <div className="mt-4 rounded-lg border border-surface-100 bg-surface-50/50 p-2 dark:border-surface-800 dark:bg-surface-950/40">
+                  <svg
+                    className="h-56 w-full"
+                    viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+                    role="img"
+                    aria-label={`${trendMetricLabels[trendMetric]}趋势折线图`}
+                    preserveAspectRatio="xMidYMid meet"
+                  >
+                    {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+                      const y = chartPadding.top + chartInnerHeight * (1 - ratio);
+                      return (
+                        <g key={ratio}>
+                          <line
+                            x1={chartPadding.left}
+                            x2={chartWidth - chartPadding.right}
+                            y1={y}
+                            y2={y}
+                            stroke="currentColor"
+                            className="text-surface-200 dark:text-surface-800"
+                            strokeWidth="1"
+                          />
+                          <text
+                            x={chartPadding.left - 7}
+                            y={y + 3}
+                            textAnchor="end"
+                            className="fill-surface-400 text-[9px]"
+                          >
+                            {formatTrendValue(trendData.maxBucketValue * ratio, trendMetric, true)}
+                          </text>
+                        </g>
+                      );
+                    })}
+
+                    {trendData.series.map((series) => {
+                      const points = trendData.buckets.map((bucket, index) => ({
+                        x: chartX(index),
+                        y: chartY(bucket.values.get(series.name) ?? 0),
+                        value: bucket.values.get(series.name) ?? 0,
+                        bucket,
+                      }));
+                      return (
+                        <g key={series.name}>
+                          <polyline
+                            points={points.map((point) => `${point.x},${point.y}`).join(" ")}
+                            fill="none"
+                            stroke={series.color}
+                            strokeWidth="2.5"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            vectorEffect="non-scaling-stroke"
+                          />
+                          {points.map((point, index) => (
+                            <circle
+                              key={`${series.name}-${index}`}
+                              cx={point.x}
+                              cy={point.y}
+                              r={point.value > 0 ? 3 : 1.5}
+                              fill={series.color}
+                              vectorEffect="non-scaling-stroke"
                             >
-                              {bucket.total > 0 && (
-                                <div className="flex h-full w-full flex-col-reverse">
-                                  {trendData.series.map((series) => {
-                                    const value = bucket.values.get(series.name) ?? 0;
-                                    if (value <= 0) return null;
-                                    return (
-                                      <div
-                                        key={series.name}
-                                        style={{
-                                          height: `${(value / bucket.total) * 100}%`,
-                                          backgroundColor: series.color,
-                                        }}
-                                      />
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                            <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-2 hidden min-w-44 -translate-x-1/2 rounded-md border border-surface-200 bg-white px-3 py-2 text-xs shadow-lg group-hover:block dark:border-surface-700 dark:bg-surface-950">
-                              <div className="font-medium text-surface-800 dark:text-surface-100">
-                                {bucket.rangeLabel}
-                              </div>
-                              <div className="mt-1 font-mono text-surface-500 dark:text-surface-400">
-                                {formatTrendValue(bucket.total, trendMetric)}
-                              </div>
-                            </div>
-                          </div>
-                          <div className="mt-2 truncate text-center text-[10px] text-surface-500 dark:text-surface-400">
-                            {bucket.label}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
+                              <title>
+                                {series.name} · {point.bucket.rangeLabel}: {formatTrendValue(point.value, trendMetric)}
+                              </title>
+                            </circle>
+                          ))}
+                        </g>
+                      );
+                    })}
+
+                    {trendData.buckets.map((bucket, index) =>
+                      index % chartLabelStep === 0 || index === trendData.buckets.length - 1 ? (
+                        <text
+                          key={`${bucket.label}-${index}`}
+                          x={chartX(index)}
+                          y={chartHeight - 9}
+                          textAnchor="middle"
+                          className="fill-surface-400 text-[9px]"
+                        >
+                          {bucket.label}
+                        </text>
+                      ) : null,
+                    )}
+                  </svg>
                 </div>
 
                 <div className="mt-4 flex flex-wrap gap-2">
@@ -749,92 +825,76 @@ export default function Logs() {
           <div className="divide-y divide-surface-100 dark:divide-surface-800/60">
             {pagedLogs.map((log, index) => {
               const cost = costFor(log);
+              const entryKey = log.id > 0
+                ? String(log.id)
+                : `${log.timestamp}-${log.method}-${log.path}-${log.model}-${log.provider}-${index}`;
+              const expanded = expandedLog === entryKey;
               return (
                 <article
-                  key={`${log.timestamp}-${log.path}-${index}`}
-                  className="px-4 py-4 text-sm text-surface-700 transition-colors hover:bg-surface-50 dark:text-surface-200 dark:hover:bg-surface-950"
+                  key={entryKey}
+                  className="text-sm text-surface-700 transition-colors hover:bg-surface-50 dark:text-surface-200 dark:hover:bg-surface-950"
                 >
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                    <span className={`badge ${statusClass(log.status)}`}>{log.status}</span>
-                    <time className="font-mono text-xs text-surface-500 dark:text-surface-400">
-                      {formatTime(log.timestamp)}
-                    </time>
-                    <span className="min-w-0 break-all font-mono text-xs text-surface-600 dark:text-surface-300">
-                      {log.method} {log.path}
-                    </span>
-                    <span className="ml-auto whitespace-nowrap font-mono text-xs text-surface-500">
-                      {log.duration_ms}ms
-                    </span>
-                  </div>
+                  <button
+                    className="w-full px-3 py-2.5 text-left"
+                    onClick={() => setExpandedLog(expanded ? null : entryKey)}
+                    aria-expanded={expanded}
+                  >
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+                      <span className={`badge ${statusClass(log.status)}`}>{log.status}</span>
+                      <time className="font-mono text-[11px] text-surface-500 dark:text-surface-400">
+                        {formatTime(log.timestamp)}
+                      </time>
+                      <span className="min-w-0 break-all font-medium text-surface-900 dark:text-white">
+                        {log.model || "—"}
+                      </span>
+                      <span className="text-surface-300 dark:text-surface-700">→</span>
+                      <span className="min-w-0 break-all text-surface-600 dark:text-surface-300">
+                        {log.provider || "—"}
+                      </span>
+                      <span className="ml-auto whitespace-nowrap font-mono text-xs text-surface-500">
+                        {log.duration_ms}ms
+                      </span>
+                      <span className="whitespace-nowrap font-mono text-xs">
+                        {cost ? formatMoney(cost.usd, "$") : "未配置价格"}
+                      </span>
+                      <ChevronDown
+                        className={`h-4 w-4 shrink-0 text-surface-400 transition-transform ${expanded ? "rotate-180" : ""}`}
+                      />
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-surface-500 dark:text-surface-400">
+                      <span className="min-w-0 break-all font-mono">{log.method} {log.path}</span>
+                      <span className="inline-flex items-center gap-1">
+                        <KeyRound className="h-3 w-3" />{log.api_key_name || "—"}
+                      </span>
+                      <span className="text-emerald-600 dark:text-emerald-300">In {formatTokens(log.input_tokens)}</span>
+                      <span className="text-sky-600 dark:text-sky-300">Out {formatTokens(log.output_tokens)}</span>
+                      {log.error && <span className="font-medium text-red-600 dark:text-red-400">有错误详情</span>}
+                    </div>
+                  </button>
 
-                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    <div className="min-w-0 rounded-md bg-surface-50 px-3 py-2 dark:bg-surface-950">
-                      <div className="metric-label">模型</div>
-                      <div className="mt-1 break-all font-medium">{log.model || "—"}</div>
-                    </div>
-                    <div className="min-w-0 rounded-md bg-surface-50 px-3 py-2 dark:bg-surface-950">
-                      <div className="metric-label">服务商</div>
-                      <div className="mt-1 break-all font-medium">{log.provider || "—"}</div>
-                    </div>
-                    <div className="min-w-0 rounded-md bg-surface-50 px-3 py-2 dark:bg-surface-950">
-                      <div className="metric-label">密钥</div>
-                      <div className="mt-1 flex min-w-0 items-center gap-1 font-medium">
-                        <KeyRound className="h-3 w-3 shrink-0 text-surface-400" />
-                        <span className="break-all">{log.api_key_name || "—"}</span>
+                  {expanded && (
+                    <div className="border-t border-surface-100 bg-surface-50/70 px-3 py-3 dark:border-surface-800 dark:bg-surface-950/50">
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                        {[
+                          ["Input", log.input_tokens, "text-emerald-600 dark:text-emerald-300"],
+                          ["Output", log.output_tokens, "text-sky-600 dark:text-sky-300"],
+                          ["Cache Read", log.cache_read_tokens ?? log.cached_tokens, "text-violet-600 dark:text-violet-300"],
+                          ["Cache Write", log.cache_write_tokens ?? 0, "text-fuchsia-600 dark:text-fuchsia-300"],
+                          ["费用", cost ? `${formatMoney(cost.usd, "$")} / ${formatMoney(cost.cny, "¥")}` : "未配置", "text-surface-700 dark:text-surface-200"],
+                        ].map(([label, value, color]) => (
+                          <div key={String(label)} className="rounded-md border border-surface-200 bg-white px-2.5 py-2 dark:border-surface-800 dark:bg-surface-900">
+                            <div className="metric-label">{label}</div>
+                            <div className={`mt-1 break-all font-mono text-xs ${color}`}>
+                              {typeof value === "number" ? formatTokens(value) : value}
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
-                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
-                      <div className="metric-label">Input</div>
-                      <div className="mt-1 inline-flex items-center gap-1 font-mono text-xs text-emerald-600 dark:text-emerald-300">
-                        <ArrowDown className="h-3 w-3" />
-                        {log.input_tokens > 0 ? formatTokens(log.input_tokens) : "—"}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
-                      <div className="metric-label">Output</div>
-                      <div className="mt-1 inline-flex items-center gap-1 font-mono text-xs text-sky-600 dark:text-sky-300">
-                        <ArrowUp className="h-3 w-3" />
-                        {log.output_tokens > 0 ? formatTokens(log.output_tokens) : "—"}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
-                      <div className="metric-label">Cache Read</div>
-                      <div className="mt-1 font-mono text-xs text-violet-600 dark:text-violet-300">
-                        {(log.cache_read_tokens ?? log.cached_tokens) > 0
-                          ? formatTokens(log.cache_read_tokens ?? log.cached_tokens)
-                          : "—"}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800">
-                      <div className="metric-label">Cache Write</div>
-                      <div className="mt-1 font-mono text-xs text-fuchsia-600 dark:text-fuchsia-300">
-                        {(log.cache_write_tokens ?? 0) > 0
-                          ? formatTokens(log.cache_write_tokens)
-                          : "—"}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-surface-100 px-3 py-2 dark:border-surface-800 sm:col-span-2 xl:col-span-2">
-                      <div className="metric-label">费用</div>
-                      <div className="mt-1 font-mono text-xs">
-                        {cost ? (
-                          <>
-                            {formatMoney(cost.usd, "$")}
-                            <span className="mx-1 text-surface-400">/</span>
-                            {formatMoney(cost.cny, "¥")}
-                          </>
-                        ) : (
-                          <span className="text-surface-400">未配置</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {log.error && (
-                    <div className="mt-2 break-words rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
-                      {log.error}
+                      {log.error && (
+                        <div className="mt-2 break-words rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+                          {log.error}
+                        </div>
+                      )}
                     </div>
                   )}
                 </article>

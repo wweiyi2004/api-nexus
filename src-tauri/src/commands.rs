@@ -72,6 +72,7 @@ pub async fn add_provider(
 ) -> Result<AppConfig, String> {
     let mut config = state.config.write().await;
     config.providers.push(provider);
+    *config = config::normalize_config(config.clone());
     config::save_config(&config)?;
     Ok(config.clone())
 }
@@ -89,6 +90,7 @@ pub async fn update_provider(
     if let Some(p) = found {
         *p = provider;
     }
+    *config = config::normalize_config(config.clone());
     config::save_config(&config)?;
     Ok(config.clone())
 }
@@ -100,6 +102,7 @@ pub async fn remove_provider(
 ) -> Result<AppConfig, String> {
     let mut config = state.config.write().await;
     config.providers.retain(|p| p.id != id);
+    *config = config::normalize_config(config.clone());
     config::save_config(&config)?;
     Ok(config.clone())
 }

@@ -15,9 +15,15 @@ interface Provider {
 
 interface AppConfig {
   providers: Provider[];
+  model_routes: ModelRoute[];
   proxy_port: number;
   proxy_host: string;
   auto_start: boolean;
+}
+
+interface ModelRoute {
+  model: string;
+  provider_ids: string[];
 }
 
 interface ModelInfo {
@@ -31,45 +37,31 @@ interface ModelInfo {
   }[];
 }
 
-export function reorderProvidersByRoute(
-  providers: Provider[],
+export function reorderModelRoutes(
+  routes: ModelRoute[],
+  model: string,
   routeProviderIds: string[],
   sourceId: string,
   targetId: string,
 ) {
-  if (sourceId === targetId) return providers;
+  if (sourceId === targetId) return routes;
 
   const sourceIndex = routeProviderIds.indexOf(sourceId);
   const targetIndex = routeProviderIds.indexOf(targetId);
-  if (sourceIndex < 0 || targetIndex < 0) return providers;
+  if (sourceIndex < 0 || targetIndex < 0) return routes;
 
   const reorderedRouteIds = [...routeProviderIds];
   const [movedId] = reorderedRouteIds.splice(sourceIndex, 1);
   reorderedRouteIds.splice(targetIndex, 0, movedId);
 
-  const originalIndex = new Map(providers.map((provider, index) => [provider.id, index]));
-  const globallySorted = [...providers].sort(
-    (a, b) =>
-      a.priority - b.priority ||
-      (originalIndex.get(a.id) ?? 0) - (originalIndex.get(b.id) ?? 0),
-  );
-  const routeProviderSet = new Set(routeProviderIds);
-  const providerById = new Map(providers.map((provider) => [provider.id, provider]));
-  let routeIndex = 0;
-  const reorderedGlobal = globallySorted.map((provider) => {
-    if (!routeProviderSet.has(provider.id)) return provider;
-    const nextProvider = providerById.get(reorderedRouteIds[routeIndex]);
-    routeIndex += 1;
-    return nextProvider ?? provider;
-  });
-  const priorityById = new Map(
-    reorderedGlobal.map((provider, priority) => [provider.id, priority]),
-  );
+  const existingIndex = routes.findIndex((route) => route.model === model);
+  if (existingIndex < 0) {
+    return [...routes, { model, provider_ids: reorderedRouteIds }];
+  }
 
-  return providers.map((provider) => ({
-    ...provider,
-    priority: priorityById.get(provider.id) ?? provider.priority,
-  }));
+  return routes.map((route, index) =>
+    index === existingIndex ? { ...route, provider_ids: reorderedRouteIds } : route,
+  );
 }
 
 export default function Models() {
@@ -95,6 +87,12 @@ export default function Models() {
 
   const models = useMemo(() => {
     const modelMap = new Map<string, ModelInfo>();
+    const routeMap = new Map(
+      (config?.model_routes ?? []).map((route) => [
+        route.model,
+        new Map(route.provider_ids.map((providerId, index) => [providerId, index])),
+      ]),
+    );
     for (const provider of config?.providers ?? []) {
       for (const model of provider.models) {
         if (!modelMap.has(model)) {
@@ -113,7 +111,14 @@ export default function Models() {
     return [...modelMap.values()]
       .map((model) => ({
         ...model,
-        providers: model.providers.sort((a, b) => a.priority - b.priority),
+        providers: model.providers.sort((a, b) => {
+          const positions = routeMap.get(model.name);
+          return (
+            (positions?.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+              (positions?.get(b.id) ?? Number.MAX_SAFE_INTEGER) ||
+            a.priority - b.priority
+          );
+        }),
       }))
       .filter((model) => model.name.toLowerCase().includes(query.toLowerCase()));
   }, [config, query]);
@@ -139,8 +144,9 @@ export default function Models() {
     const previousConfig = config;
     const nextConfig = {
       ...config,
-      providers: reorderProvidersByRoute(
-        config.providers,
+      model_routes: reorderModelRoutes(
+        config.model_routes ?? [],
+        modelName,
         model.providers.map((provider) => provider.id),
         draggedRoute.providerId,
         targetProviderId,
@@ -184,7 +190,7 @@ export default function Models() {
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-surface-200 bg-surface-50 px-4 py-3 text-sm text-surface-600 dark:border-surface-800 dark:bg-surface-900 dark:text-surface-300">
-        <span>拖动路由即可调整服务商全局优先级，顺序会自动保存。</span>
+        <span>拖动路由只会调整当前模型的服务商优先级，顺序会自动保存。</span>
         {savingPriority && (
           <span className="inline-flex items-center gap-2 text-cyan-700 dark:text-cyan-300">
             <Loader2 className="h-4 w-4 animate-spin" />

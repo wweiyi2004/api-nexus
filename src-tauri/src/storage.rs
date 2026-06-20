@@ -7,11 +7,15 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLogEntry {
+    #[serde(default)]
+    pub id: i64,
     pub timestamp: i64,
     pub method: String,
     pub path: String,
     pub model: String,
     pub provider: String,
+    #[serde(default)]
+    pub provider_id: String,
     pub api_key_name: String,
     pub status: u16,
     pub input_tokens: u64,
@@ -85,11 +89,11 @@ impl RequestLogStore {
         self.entries.read().await.iter().rev().cloned().collect()
     }
 
-    pub async fn push(&self, entry: RequestLogEntry) -> Result<(), String> {
+    pub async fn push(&self, mut entry: RequestLogEntry) -> Result<(), String> {
         let policy = *self.policy.read().await;
         {
             let connection = self.connection.lock().map_err(|error| error.to_string())?;
-            insert_entry(&connection, &entry)?;
+            entry.id = insert_entry(&connection, &entry)?;
             prune_connection(&connection, policy)?;
         }
 
@@ -198,18 +202,20 @@ impl RequestLogStore {
     pub async fn export_csv(&self) -> String {
         let entries = self.list().await;
         let mut csv = String::from(
-            "timestamp,method,path,model,provider,api_key_name,status,duration_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,error\r\n",
+            "id,timestamp,method,path,model,provider,provider_id,api_key_name,status,duration_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,error\r\n",
         );
         for entry in entries {
             let timestamp = chrono::DateTime::from_timestamp(entry.timestamp, 0)
                 .map(|value| value.to_rfc3339())
                 .unwrap_or_else(|| entry.timestamp.to_string());
             let fields = [
+                entry.id.to_string(),
                 timestamp,
                 entry.method,
                 entry.path,
                 entry.model,
                 entry.provider,
+                entry.provider_id,
                 entry.api_key_name,
                 entry.status.to_string(),
                 entry.duration_ms.to_string(),
@@ -244,6 +250,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 path TEXT NOT NULL,
                 model TEXT NOT NULL,
                 provider TEXT NOT NULL,
+                provider_id TEXT NOT NULL DEFAULT '',
                 api_key_name TEXT NOT NULL,
                 status INTEGER NOT NULL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -261,23 +268,52 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    ensure_column(
+        connection,
+        "request_logs",
+        "provider_id",
+        "ALTER TABLE request_logs ADD COLUMN provider_id TEXT NOT NULL DEFAULT ''",
+    )?;
     Ok(())
 }
 
-fn insert_entry(connection: &Connection, entry: &RequestLogEntry) -> Result<(), String> {
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if !existing.iter().any(|name| name == column) {
+        connection
+            .execute(alter_sql, [])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn insert_entry(connection: &Connection, entry: &RequestLogEntry) -> Result<i64, String> {
     connection
         .execute(
             "INSERT INTO request_logs (
-                timestamp, method, path, model, provider, api_key_name, status,
+                timestamp, method, path, model, provider, provider_id, api_key_name, status,
                 input_tokens, output_tokens, cached_tokens, cache_read_tokens,
                 cache_write_tokens, duration_ms, error
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 entry.timestamp,
                 entry.method,
                 entry.path,
                 entry.model,
                 entry.provider,
+                entry.provider_id,
                 entry.api_key_name,
                 entry.status,
                 entry.input_tokens as i64,
@@ -290,13 +326,13 @@ fn insert_entry(connection: &Connection, entry: &RequestLogEntry) -> Result<(), 
             ],
         )
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(connection.last_insert_rowid())
 }
 
 fn load_entries(connection: &Connection) -> Result<VecDeque<RequestLogEntry>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT timestamp, method, path, model, provider, api_key_name, status,
+            "SELECT id, timestamp, method, path, model, provider, provider_id, api_key_name, status,
                     input_tokens, output_tokens, cached_tokens, cache_read_tokens,
                     cache_write_tokens, duration_ms, error
              FROM request_logs ORDER BY id ASC",
@@ -305,20 +341,22 @@ fn load_entries(connection: &Connection) -> Result<VecDeque<RequestLogEntry>, St
     let rows = statement
         .query_map([], |row| {
             Ok(RequestLogEntry {
-                timestamp: row.get(0)?,
-                method: row.get(1)?,
-                path: row.get(2)?,
-                model: row.get(3)?,
-                provider: row.get(4)?,
-                api_key_name: row.get(5)?,
-                status: row.get(6)?,
-                input_tokens: row.get::<_, i64>(7)? as u64,
-                output_tokens: row.get::<_, i64>(8)? as u64,
-                cached_tokens: row.get::<_, i64>(9)? as u64,
-                cache_read_tokens: row.get::<_, i64>(10)? as u64,
-                cache_write_tokens: row.get::<_, i64>(11)? as u64,
-                duration_ms: row.get::<_, i64>(12)? as u64,
-                error: row.get(13)?,
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                method: row.get(2)?,
+                path: row.get(3)?,
+                model: row.get(4)?,
+                provider: row.get(5)?,
+                provider_id: row.get(6)?,
+                api_key_name: row.get(7)?,
+                status: row.get(8)?,
+                input_tokens: row.get::<_, i64>(9)? as u64,
+                output_tokens: row.get::<_, i64>(10)? as u64,
+                cached_tokens: row.get::<_, i64>(11)? as u64,
+                cache_read_tokens: row.get::<_, i64>(12)? as u64,
+                cache_write_tokens: row.get::<_, i64>(13)? as u64,
+                duration_ms: row.get::<_, i64>(14)? as u64,
+                error: row.get(15)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -367,11 +405,13 @@ mod tests {
 
     fn entry(timestamp: i64, path: &str) -> RequestLogEntry {
         RequestLogEntry {
+            id: 0,
             timestamp,
             method: "POST".to_string(),
             path: path.to_string(),
             model: "test-model".to_string(),
             provider: "provider".to_string(),
+            provider_id: "provider-id".to_string(),
             api_key_name: "client".to_string(),
             status: 200,
             input_tokens: 10,
@@ -391,7 +431,10 @@ mod tests {
             .push(entry(chrono::Utc::now().timestamp(), "/v1/messages"))
             .await
             .unwrap();
-        assert_eq!(store.list().await.len(), 1);
+        let logs = store.list().await;
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].id > 0);
+        assert_eq!(logs[0].provider_id, "provider-id");
         assert_eq!(store.initial_token_stats().unwrap().input_tokens, 10);
         store.clear().await.unwrap();
         assert!(store.list().await.is_empty());

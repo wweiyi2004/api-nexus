@@ -16,17 +16,27 @@ interface ProxyApiKey {
   enabled: boolean;
 }
 
+interface Provider {
+  id: string;
+  name: string;
+}
+
 interface ModelPrice {
+  provider_id: string;
   model: string;
   input_usd_per_million: number;
   output_usd_per_million: number;
   cached_usd_per_million: number;
   cache_read_usd_per_million: number;
   cache_write_usd_per_million: number;
+  source_url: string;
+  source_note: string;
+  updated_at: string;
+  automatic: boolean;
 }
 
 interface AppConfig {
-  providers: unknown[];
+  providers: Provider[];
   proxy_port: number;
   proxy_host: string;
   auto_start: boolean;
@@ -41,13 +51,29 @@ interface AppConfig {
 
 const emptyAlias: ModelAlias = { alias: "", model: "" };
 const emptyPrice: ModelPrice = {
+  provider_id: "",
   model: "",
   input_usd_per_million: 0,
   output_usd_per_million: 0,
   cached_usd_per_million: 0,
   cache_read_usd_per_million: 0,
   cache_write_usd_per_million: 0,
+  source_url: "",
+  source_note: "",
+  updated_at: "",
+  automatic: false,
 };
+
+function manualPrice(price: ModelPrice, changes: Partial<ModelPrice>): ModelPrice {
+  return {
+    ...price,
+    ...changes,
+    automatic: false,
+    source_url: "",
+    source_note: "",
+    updated_at: "",
+  };
+}
 
 function generateProxyKey() {
   return `sk-nexus-${crypto.randomUUID().replaceAll("-", "")}`;
@@ -494,80 +520,103 @@ export default function Settings() {
         </div>
         <div className="space-y-2 p-4">
           {config.model_prices.map((price, index) => (
-            <div key={`${price.model}-${index}`} className="grid grid-cols-1 gap-2 lg:grid-cols-[1fr_repeat(4,8rem)_auto]">
-              <input
-                className="input-field"
-                placeholder="模型名"
-                value={price.model}
-                onChange={(e) => {
-                  const next = [...config.model_prices];
-                  next[index] = { ...price, model: e.target.value };
-                  setConfig({ ...config, model_prices: next });
-                }}
-              />
-              <input
-                className="input-field"
-                type="number"
-                min="0"
-                step="0.0001"
-                placeholder="Input"
-                value={price.input_usd_per_million}
-                onChange={(e) => {
-                  const next = [...config.model_prices];
-                  next[index] = { ...price, input_usd_per_million: parseFloat(e.target.value) || 0 };
-                  setConfig({ ...config, model_prices: next });
-                }}
-              />
-              <input
-                className="input-field"
-                type="number"
-                min="0"
-                step="0.0001"
-                placeholder="Output"
-                value={price.output_usd_per_million}
-                onChange={(e) => {
-                  const next = [...config.model_prices];
-                  next[index] = { ...price, output_usd_per_million: parseFloat(e.target.value) || 0 };
-                  setConfig({ ...config, model_prices: next });
-                }}
-              />
-              <input
-                className="input-field"
-                type="number"
-                min="0"
-                step="0.0001"
-                placeholder="Cache Read"
-                value={price.cache_read_usd_per_million}
-                onChange={(e) => {
-                  const next = [...config.model_prices];
-                  const value = parseFloat(e.target.value) || 0;
-                  next[index] = { ...price, cache_read_usd_per_million: value, cached_usd_per_million: value };
-                  setConfig({ ...config, model_prices: next });
-                }}
-              />
-              <input
-                className="input-field"
-                type="number"
-                min="0"
-                step="0.0001"
-                placeholder="Cache Write"
-                value={price.cache_write_usd_per_million}
-                onChange={(e) => {
-                  const next = [...config.model_prices];
-                  next[index] = { ...price, cache_write_usd_per_million: parseFloat(e.target.value) || 0 };
-                  setConfig({ ...config, model_prices: next });
-                }}
-              />
-              <button
-                className="btn-icon"
-                title="删除"
-                onClick={() => {
-                  const next = config.model_prices.filter((_, i) => i !== index);
-                  setConfig({ ...config, model_prices: next });
-                }}
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
+            <div key={`${price.provider_id}-${price.model}-${index}`} className="space-y-1">
+              <div className="grid grid-cols-1 gap-2 lg:grid-cols-[10rem_1fr_repeat(4,7.5rem)_auto]">
+                <select
+                  className="input-field"
+                  value={price.provider_id}
+                  onChange={(e) => {
+                    const next = [...config.model_prices];
+                    next[index] = manualPrice(price, { provider_id: e.target.value });
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                  title="价格适用的服务商"
+                >
+                  <option value="">全部服务商</option>
+                  {config.providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>{provider.name}</option>
+                  ))}
+                </select>
+                <input
+                  className="input-field"
+                  placeholder="模型名"
+                  value={price.model}
+                  onChange={(e) => {
+                    const next = [...config.model_prices];
+                    next[index] = manualPrice(price, { model: e.target.value });
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                />
+                <input
+                  className="input-field"
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  placeholder="Input"
+                  value={price.input_usd_per_million}
+                  onChange={(e) => {
+                    const next = [...config.model_prices];
+                    next[index] = manualPrice(price, { input_usd_per_million: parseFloat(e.target.value) || 0 });
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                />
+                <input
+                  className="input-field"
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  placeholder="Output"
+                  value={price.output_usd_per_million}
+                  onChange={(e) => {
+                    const next = [...config.model_prices];
+                    next[index] = manualPrice(price, { output_usd_per_million: parseFloat(e.target.value) || 0 });
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                />
+                <input
+                  className="input-field"
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  placeholder="Cache Read"
+                  value={price.cache_read_usd_per_million}
+                  onChange={(e) => {
+                    const next = [...config.model_prices];
+                    const value = parseFloat(e.target.value) || 0;
+                    next[index] = manualPrice(price, { cache_read_usd_per_million: value, cached_usd_per_million: value });
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                />
+                <input
+                  className="input-field"
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  placeholder="Cache Write"
+                  value={price.cache_write_usd_per_million}
+                  onChange={(e) => {
+                    const next = [...config.model_prices];
+                    next[index] = manualPrice(price, { cache_write_usd_per_million: parseFloat(e.target.value) || 0 });
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                />
+                <button
+                  className="btn-icon"
+                  title="删除"
+                  onClick={() => {
+                    const next = config.model_prices.filter((_, i) => i !== index);
+                    setConfig({ ...config, model_prices: next });
+                  }}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+              {price.source_url && (
+                <div className="px-1 text-[11px] text-surface-400">
+                  {price.automatic ? "自动价格" : "价格来源"} · {price.source_note}{price.updated_at ? ` · ${price.updated_at}` : ""} ·{" "}
+                  <a className="text-cyan-600 hover:underline dark:text-cyan-300" href={price.source_url} target="_blank" rel="noreferrer">官方来源</a>
+                </div>
+              )}
             </div>
           ))}
           {config.model_prices.length === 0 && (
@@ -575,7 +624,18 @@ export default function Settings() {
               暂无价格。添加后请求日志会自动计算每条请求费用。
             </div>
           )}
-          <div className="grid grid-cols-1 gap-2 pt-2 lg:grid-cols-[1fr_repeat(4,8rem)_auto]">
+          <div className="grid grid-cols-1 gap-2 pt-2 lg:grid-cols-[10rem_1fr_repeat(4,7.5rem)_auto]">
+            <select
+              className="input-field"
+              value={newPrice.provider_id}
+              onChange={(e) => setNewPrice({ ...newPrice, provider_id: e.target.value })}
+              title="价格适用的服务商"
+            >
+              <option value="">全部服务商</option>
+              {config.providers.map((provider) => (
+                <option key={provider.id} value={provider.id}>{provider.name}</option>
+              ))}
+            </select>
             <input
               className="input-field"
               placeholder="模型名"

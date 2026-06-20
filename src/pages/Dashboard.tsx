@@ -20,11 +20,13 @@ import {
 } from "lucide-react";
 
 interface RequestLogEntry {
+  id: number;
   timestamp: number;
   method: string;
   path: string;
   model: string;
   provider: string;
+  provider_id: string;
   api_key_name: string;
   status: number;
   input_tokens: number;
