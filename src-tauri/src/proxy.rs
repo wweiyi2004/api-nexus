@@ -326,6 +326,24 @@ fn base_url_has_path(base_url: &str) -> bool {
     without_scheme.contains('/')
 }
 
+fn base_url_ends_with_version_segment(base_url: &str) -> bool {
+    let Some(segment) = base_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+    else {
+        return false;
+    };
+
+    let lower = segment.to_ascii_lowercase();
+    lower == "v1"
+        || lower == "v1beta"
+        || lower == "v3"
+        || lower == "v4"
+        || lower.chars().all(|ch| ch.is_ascii_digit())
+}
+
 fn strip_standard_v1_prefix(path: &str) -> &str {
     let trimmed = path.trim_start_matches('/');
     trimmed.strip_prefix("v1/").unwrap_or(trimmed)
@@ -364,7 +382,7 @@ pub(crate) fn anthropic_upstream_url(base_url: &str, path: &str) -> String {
         return base.to_string();
     }
 
-    if base_url_has_path(base) {
+    if base_url_ends_with_version_segment(base) {
         join_upstream_url(base, without_v1)
     } else {
         join_upstream_url(base, requested)
@@ -2318,10 +2336,10 @@ mod tests {
         );
         assert_eq!(
             openai_upstream_url(
-                "https://ark.cn-beijing.volces.com/api/coding",
+                "https://ark.cn-beijing.volces.com/api/coding/v3",
                 "/v1/chat/completions"
             ),
-            "https://ark.cn-beijing.volces.com/api/coding/chat/completions"
+            "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
         );
         assert_eq!(
             openai_upstream_url("https://open.bigmodel.cn/api/paas/v4/", "/v1/models"),
@@ -2344,11 +2362,22 @@ mod tests {
         );
         assert_eq!(
             anthropic_upstream_url("https://api.deepseek.com/anthropic", "/v1/messages"),
-            "https://api.deepseek.com/anthropic/messages"
+            "https://api.deepseek.com/anthropic/v1/messages"
         );
         assert_eq!(
             anthropic_upstream_url("https://api.example.com/anthropic/v1", "/v1/messages"),
             "https://api.example.com/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic_upstream_url(
+                "https://api.deepseek.com/anthropic",
+                "/v1/messages/count_tokens"
+            ),
+            "https://api.deepseek.com/anthropic/v1/messages/count_tokens"
+        );
+        assert_eq!(
+            anthropic_upstream_url("https://api.example.com/anthropic/v1beta", "/v1/messages"),
+            "https://api.example.com/anthropic/v1beta/messages"
         );
     }
 
@@ -2385,6 +2414,49 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.text().await.unwrap(), upstream_body);
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_requests_reach_volcengine_coding_endpoint() {
+        let upstream = Router::new().route(
+            "/api/coding/v3/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "id": "volcengine-coding-response",
+                    "object": "chat.completion",
+                    "model": "test-model",
+                    "choices": []
+                }))
+                .into_response()
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![provider(
+                format!("http://{}/api/coding/v3", upstream_addr),
+                0,
+            )],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["id"], "volcengine-coding-response");
 
         upstream_task.abort();
         proxy_task.abort();

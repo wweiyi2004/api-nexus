@@ -145,7 +145,7 @@ const providerPresets: Array<{
     label: "火山方舟 · Coding 订阅",
     name: "火山方舟 Coding",
     protocol: "openai",
-    base_url: "https://ark.cn-beijing.volces.com/api/coding",
+    base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
     models: [],
   },
   {
