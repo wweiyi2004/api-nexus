@@ -73,7 +73,7 @@ Updater signing secrets are already consumed as `TAURI_SIGNING_PRIVATE_KEY` and 
 - `WINDOWS_CERTIFICATE`: Base64-encoded trusted code-signing PFX
 - `WINDOWS_CERTIFICATE_PASSWORD`: PFX password
 
-The release workflow deliberately refuses to publish unsigned Windows installers.
+When these secrets are absent, the release workflow still publishes Windows installers without Authenticode signing. Tauri updater artifacts remain signed with the updater key.
 
 ## Client Configuration
 
