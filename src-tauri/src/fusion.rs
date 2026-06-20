@@ -335,6 +335,7 @@ fn tool_calling_requested(body: &Value) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_messages(
     client: &Client,
     store: &Arc<RequestLogStore>,
@@ -416,6 +417,7 @@ async fn run_with_messages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_fusion(
     client: &Client,
     store: &Arc<RequestLogStore>,

@@ -34,7 +34,7 @@ pub struct AppConfig {
     pub fusion: FusionConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelRef {
     #[serde(default)]
     pub provider_id: String,
@@ -605,15 +605,6 @@ impl Default for AppConfig {
             log_retention_days: default_log_retention_days(),
             max_log_entries: default_max_log_entries(),
             fusion: FusionConfig::default(),
-        }
-    }
-}
-
-impl Default for ModelRef {
-    fn default() -> Self {
-        Self {
-            provider_id: String::new(),
-            model: String::new(),
         }
     }
 }
