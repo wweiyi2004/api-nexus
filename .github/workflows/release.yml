@@ -44,12 +44,15 @@ jobs:
       - name: Rust dependency audit
         run: cargo audit --file src-tauri/Cargo.lock
       - name: Import Windows code-signing certificate
-        if: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            Write-Warning "Windows Authenticode certificate is not configured; publishing unsigned installers."
+            exit 0
+          }
           $pfxPath = Join-Path $env:RUNNER_TEMP "api-nexus-signing.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
           $securePassword = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
@@ -64,10 +67,6 @@ jobs:
             }
           } | ConvertTo-Json -Compress -Depth 5
           "TAURI_CONFIG=$config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Report unsigned Windows build
-        if: ${{ secrets.WINDOWS_CERTIFICATE == '' || secrets.WINDOWS_CERTIFICATE_PASSWORD == '' }}
-        shell: pwsh
-        run: Write-Warning "Windows Authenticode certificate is not configured; publishing unsigned installers."
       - name: Build, sign and publish Tauri release
         uses: tauri-apps/tauri-action@v0
         env:
