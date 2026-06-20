@@ -30,6 +30,32 @@ pub struct AppConfig {
     pub log_retention_days: u32,
     #[serde(default = "default_max_log_entries")]
     pub max_log_entries: usize,
+    #[serde(default)]
+    pub fusion: FusionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRef {
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionConfig {
+    #[serde(default = "default_fusion_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub panel_models: Vec<ModelRef>,
+    #[serde(default)]
+    pub judge_model: Option<ModelRef>,
+    #[serde(default)]
+    pub final_model: Option<ModelRef>,
+    #[serde(default = "default_fusion_max_panel_models")]
+    pub max_panel_models: u8,
+    #[serde(default = "default_fusion_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +154,18 @@ fn default_log_retention_days() -> u32 {
 
 fn default_max_log_entries() -> usize {
     10_000
+}
+
+fn default_fusion_enabled() -> bool {
+    true
+}
+
+fn default_fusion_max_panel_models() -> u8 {
+    4
+}
+
+fn default_fusion_timeout_secs() -> u64 {
+    120
 }
 
 fn default_provider_enabled() -> bool {
@@ -566,6 +604,29 @@ impl Default for AppConfig {
             usd_to_cny_rate: default_usd_to_cny_rate(),
             log_retention_days: default_log_retention_days(),
             max_log_entries: default_max_log_entries(),
+            fusion: FusionConfig::default(),
+        }
+    }
+}
+
+impl Default for ModelRef {
+    fn default() -> Self {
+        Self {
+            provider_id: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_fusion_enabled(),
+            panel_models: Vec::new(),
+            judge_model: None,
+            final_model: None,
+            max_panel_models: default_fusion_max_panel_models(),
+            timeout_secs: default_fusion_timeout_secs(),
         }
     }
 }
@@ -643,6 +704,17 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
         config.max_log_entries = default_max_log_entries();
     }
     config.max_log_entries = config.max_log_entries.clamp(100, 1_000_000);
+    if config.fusion.max_panel_models == 0 {
+        config.fusion.max_panel_models = default_fusion_max_panel_models();
+    }
+    config.fusion.max_panel_models = config.fusion.max_panel_models.clamp(1, 8);
+    if config.fusion.timeout_secs == 0 {
+        config.fusion.timeout_secs = default_fusion_timeout_secs();
+    }
+    config.fusion.timeout_secs = config.fusion.timeout_secs.clamp(5, 600);
+    config.fusion.panel_models = normalize_model_refs(config.fusion.panel_models);
+    config.fusion.judge_model = normalize_optional_model_ref(config.fusion.judge_model);
+    config.fusion.final_model = normalize_optional_model_ref(config.fusion.final_model);
 
     for price in &mut config.model_prices {
         if price.cache_read_usd_per_million <= 0.0 && price.cached_usd_per_million > 0.0 {
@@ -742,6 +814,29 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     }
 
     config
+}
+
+pub(crate) fn normalize_model_ref(mut model_ref: ModelRef) -> Option<ModelRef> {
+    model_ref.provider_id = model_ref.provider_id.trim().to_string();
+    model_ref.model = model_ref.model.trim().to_string();
+    if model_ref.provider_id.is_empty() || model_ref.model.is_empty() {
+        None
+    } else {
+        Some(model_ref)
+    }
+}
+
+pub(crate) fn normalize_optional_model_ref(model_ref: Option<ModelRef>) -> Option<ModelRef> {
+    model_ref.and_then(normalize_model_ref)
+}
+
+pub(crate) fn normalize_model_refs(model_refs: Vec<ModelRef>) -> Vec<ModelRef> {
+    let mut seen = HashSet::new();
+    model_refs
+        .into_iter()
+        .filter_map(normalize_model_ref)
+        .filter(|model_ref| seen.insert((model_ref.provider_id.clone(), model_ref.model.clone())))
+        .collect()
 }
 
 fn read_config_or_default() -> AppConfig {

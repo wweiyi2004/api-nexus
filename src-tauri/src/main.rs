@@ -2,6 +2,7 @@
 
 mod commands;
 mod config;
+mod fusion;
 mod proxy;
 mod security;
 mod storage;
@@ -68,6 +69,10 @@ fn main() {
             commands::get_request_logs,
             commands::clear_request_logs,
             commands::export_request_logs_csv,
+            commands::run_fusion,
+            commands::get_fusion_runs,
+            commands::get_fusion_run,
+            commands::clear_fusion_runs,
             commands::start_proxy,
             commands::stop_proxy,
             commands::test_provider,

@@ -28,6 +28,47 @@ pub struct RequestLogEntry {
     pub cache_write_tokens: u64,
     pub duration_ms: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub request_body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionRunEntry {
+    pub id: i64,
+    pub created_at: i64,
+    pub source_log_id: Option<i64>,
+    pub input_protocol: String,
+    pub status: String,
+    pub duration_ms: u64,
+    pub panel_count: u64,
+    pub total_tokens: u64,
+    pub estimated_cost: f64,
+    pub final_content: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionStepEntry {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub run_id: i64,
+    pub role: String,
+    pub provider_id: String,
+    pub model: String,
+    pub status: String,
+    pub latency_ms: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost: f64,
+    pub content: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionRunDetails {
+    pub run: FusionRunEntry,
+    pub steps: Vec<FusionStepEntry>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -117,6 +158,75 @@ impl RequestLogStore {
                 .map_err(|error| error.to_string())?;
         }
         self.entries.write().await.clear();
+        Ok(())
+    }
+
+    pub async fn create_fusion_run(
+        &self,
+        source_log_id: Option<i64>,
+        input_protocol: &str,
+    ) -> Result<i64, String> {
+        let policy = *self.policy.read().await;
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let id = insert_fusion_run(&connection, source_log_id, input_protocol)?;
+        prune_connection(&connection, policy)?;
+        Ok(id)
+    }
+
+    pub async fn push_fusion_step(&self, mut entry: FusionStepEntry) -> Result<i64, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        entry.id = insert_fusion_step(&connection, &entry)?;
+        Ok(entry.id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_fusion_run(
+        &self,
+        id: i64,
+        status: &str,
+        duration_ms: u64,
+        panel_count: u64,
+        total_tokens: u64,
+        estimated_cost: f64,
+        final_content: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        update_fusion_run(
+            &connection,
+            id,
+            status,
+            duration_ms,
+            panel_count,
+            total_tokens,
+            estimated_cost,
+            final_content,
+            error,
+        )
+    }
+
+    pub async fn list_fusion_runs(&self) -> Result<Vec<FusionRunEntry>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        load_fusion_runs(&connection)
+    }
+
+    pub async fn get_fusion_run(&self, id: i64) -> Result<Option<FusionRunDetails>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let Some(run) = load_fusion_run(&connection, id)? else {
+            return Ok(None);
+        };
+        let steps = load_fusion_steps(&connection, id)?;
+        Ok(Some(FusionRunDetails { run, steps }))
+    }
+
+    pub async fn clear_fusion_runs(&self) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM fusion_steps", [])
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute("DELETE FROM fusion_runs", [])
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -259,9 +369,40 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL DEFAULT 0,
-                error TEXT
+                error TEXT,
+                request_body TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_request_logs_timestamp ON request_logs(timestamp);
+             CREATE TABLE IF NOT EXISTS fusion_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                source_log_id INTEGER,
+                input_protocol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                panel_count INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost REAL NOT NULL DEFAULT 0,
+                final_content TEXT,
+                error TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_fusion_runs_created_at ON fusion_runs(created_at);
+             CREATE TABLE IF NOT EXISTS fusion_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                cost REAL NOT NULL DEFAULT 0,
+                content TEXT,
+                error TEXT,
+                FOREIGN KEY(run_id) REFERENCES fusion_runs(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_fusion_steps_run_id ON fusion_steps(run_id);
              CREATE TABLE IF NOT EXISTS app_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -273,6 +414,12 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
         "request_logs",
         "provider_id",
         "ALTER TABLE request_logs ADD COLUMN provider_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "request_logs",
+        "request_body",
+        "ALTER TABLE request_logs ADD COLUMN request_body TEXT",
     )?;
     Ok(())
 }
@@ -305,8 +452,8 @@ fn insert_entry(connection: &Connection, entry: &RequestLogEntry) -> Result<i64,
             "INSERT INTO request_logs (
                 timestamp, method, path, model, provider, provider_id, api_key_name, status,
                 input_tokens, output_tokens, cached_tokens, cache_read_tokens,
-                cache_write_tokens, duration_ms, error
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                cache_write_tokens, duration_ms, error, request_body
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 entry.timestamp,
                 entry.method,
@@ -323,6 +470,7 @@ fn insert_entry(connection: &Connection, entry: &RequestLogEntry) -> Result<i64,
                 entry.cache_write_tokens as i64,
                 entry.duration_ms as i64,
                 entry.error,
+                entry.request_body,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -334,7 +482,7 @@ fn load_entries(connection: &Connection) -> Result<VecDeque<RequestLogEntry>, St
         .prepare(
             "SELECT id, timestamp, method, path, model, provider, provider_id, api_key_name, status,
                     input_tokens, output_tokens, cached_tokens, cache_read_tokens,
-                    cache_write_tokens, duration_ms, error
+                    cache_write_tokens, duration_ms, error, request_body
              FROM request_logs ORDER BY id ASC",
         )
         .map_err(|error| error.to_string())?;
@@ -357,6 +505,7 @@ fn load_entries(connection: &Connection) -> Result<VecDeque<RequestLogEntry>, St
                 cache_write_tokens: row.get::<_, i64>(13)? as u64,
                 duration_ms: row.get::<_, i64>(14)? as u64,
                 error: row.get(15)?,
+                request_body: row.get(16)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -364,11 +513,174 @@ fn load_entries(connection: &Connection) -> Result<VecDeque<RequestLogEntry>, St
         .map_err(|error| error.to_string())
 }
 
+fn insert_fusion_run(
+    connection: &Connection,
+    source_log_id: Option<i64>,
+    input_protocol: &str,
+) -> Result<i64, String> {
+    connection
+        .execute(
+            "INSERT INTO fusion_runs (
+                created_at, source_log_id, input_protocol, status
+             ) VALUES (?1, ?2, ?3, 'running')",
+            params![
+                chrono::Utc::now().timestamp(),
+                source_log_id,
+                input_protocol
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(connection.last_insert_rowid())
+}
+
+fn insert_fusion_step(connection: &Connection, entry: &FusionStepEntry) -> Result<i64, String> {
+    connection
+        .execute(
+            "INSERT INTO fusion_steps (
+                run_id, role, provider_id, model, status, latency_ms,
+                prompt_tokens, completion_tokens, cost, content, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                entry.run_id,
+                entry.role,
+                entry.provider_id,
+                entry.model,
+                entry.status,
+                entry.latency_ms as i64,
+                entry.prompt_tokens as i64,
+                entry.completion_tokens as i64,
+                entry.cost,
+                entry.content,
+                entry.error,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(connection.last_insert_rowid())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_fusion_run(
+    connection: &Connection,
+    id: i64,
+    status: &str,
+    duration_ms: u64,
+    panel_count: u64,
+    total_tokens: u64,
+    estimated_cost: f64,
+    final_content: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE fusion_runs
+             SET status = ?1,
+                 duration_ms = ?2,
+                 panel_count = ?3,
+                 total_tokens = ?4,
+                 estimated_cost = ?5,
+                 final_content = ?6,
+                 error = ?7
+             WHERE id = ?8",
+            params![
+                status,
+                duration_ms as i64,
+                panel_count as i64,
+                total_tokens as i64,
+                estimated_cost,
+                final_content,
+                error,
+                id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn row_to_fusion_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<FusionRunEntry> {
+    Ok(FusionRunEntry {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        source_log_id: row.get(2)?,
+        input_protocol: row.get(3)?,
+        status: row.get(4)?,
+        duration_ms: row.get::<_, i64>(5)? as u64,
+        panel_count: row.get::<_, i64>(6)? as u64,
+        total_tokens: row.get::<_, i64>(7)? as u64,
+        estimated_cost: row.get(8)?,
+        final_content: row.get(9)?,
+        error: row.get(10)?,
+    })
+}
+
+fn row_to_fusion_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<FusionStepEntry> {
+    Ok(FusionStepEntry {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        role: row.get(2)?,
+        provider_id: row.get(3)?,
+        model: row.get(4)?,
+        status: row.get(5)?,
+        latency_ms: row.get::<_, i64>(6)? as u64,
+        prompt_tokens: row.get::<_, i64>(7)? as u64,
+        completion_tokens: row.get::<_, i64>(8)? as u64,
+        cost: row.get(9)?,
+        content: row.get(10)?,
+        error: row.get(11)?,
+    })
+}
+
+fn fusion_run_select_sql() -> &'static str {
+    "SELECT id, created_at, source_log_id, input_protocol, status, duration_ms,
+            panel_count, total_tokens, estimated_cost, final_content, error
+     FROM fusion_runs"
+}
+
+fn load_fusion_runs(connection: &Connection) -> Result<Vec<FusionRunEntry>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "{} ORDER BY id DESC LIMIT 200",
+            fusion_run_select_sql()
+        ))
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], row_to_fusion_run)
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn load_fusion_run(connection: &Connection, id: i64) -> Result<Option<FusionRunEntry>, String> {
+    connection
+        .query_row(
+            &format!("{} WHERE id = ?1", fusion_run_select_sql()),
+            params![id],
+            row_to_fusion_run,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn load_fusion_steps(connection: &Connection, run_id: i64) -> Result<Vec<FusionStepEntry>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, run_id, role, provider_id, model, status, latency_ms,
+                    prompt_tokens, completion_tokens, cost, content, error
+             FROM fusion_steps WHERE run_id = ?1 ORDER BY id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![run_id], row_to_fusion_step)
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn prune_connection(connection: &Connection, policy: RetentionPolicy) -> Result<(), String> {
+    let cutoff = retention_cutoff(policy.retention_days);
     connection
         .execute(
             "DELETE FROM request_logs WHERE timestamp < ?1",
-            params![retention_cutoff(policy.retention_days)],
+            params![cutoff],
         )
         .map_err(|error| error.to_string())?;
     connection
@@ -377,6 +689,46 @@ fn prune_connection(connection: &Connection, policy: RetentionPolicy) -> Result<
                 SELECT id FROM request_logs ORDER BY id DESC LIMIT ?1
              )",
             params![policy.max_entries as i64],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM fusion_steps WHERE run_id IN (
+                SELECT id FROM fusion_runs WHERE created_at < ?1
+             )",
+            params![cutoff],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM fusion_runs WHERE created_at < ?1",
+            params![cutoff],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM fusion_steps WHERE run_id IN (
+                SELECT id FROM fusion_runs WHERE id NOT IN (
+                    SELECT id FROM fusion_runs ORDER BY id DESC LIMIT ?1
+                )
+             )",
+            params![policy.max_entries as i64],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM fusion_runs WHERE id NOT IN (
+                SELECT id FROM fusion_runs ORDER BY id DESC LIMIT ?1
+             )",
+            params![policy.max_entries as i64],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM fusion_steps WHERE run_id NOT IN (
+                SELECT id FROM fusion_runs
+             )",
+            [],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -421,6 +773,7 @@ mod tests {
             cache_write_tokens: 1,
             duration_ms: 25,
             error: None,
+            request_body: None,
         }
     }
 
@@ -468,5 +821,49 @@ mod tests {
         assert_eq!(logs[0].path, "/third");
         assert!(store.export_csv().await.contains("\"/second,quoted\""));
         assert_eq!(csv_escape("=SUM(1,2)"), "\"'=SUM(1,2)\"");
+    }
+
+    #[tokio::test]
+    async fn prunes_fusion_runs_with_log_policy() {
+        let store = RequestLogStore::open_in_memory(2, 30).unwrap();
+
+        for index in 0..3 {
+            let run_id = store.create_fusion_run(None, "openai").await.unwrap();
+            store
+                .push_fusion_step(FusionStepEntry {
+                    id: 0,
+                    run_id,
+                    role: "panel".to_string(),
+                    provider_id: "provider".to_string(),
+                    model: format!("model-{index}"),
+                    status: "succeeded".to_string(),
+                    latency_ms: 1,
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cost: 0.0,
+                    content: Some("ok".to_string()),
+                    error: None,
+                })
+                .await
+                .unwrap();
+            store
+                .finish_fusion_run(run_id, "succeeded", 1, 1, 2, 0.0, Some("final"), None)
+                .await
+                .unwrap();
+        }
+
+        let runs = store.list_fusion_runs().await.unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert!(store.get_fusion_run(1).await.unwrap().is_none());
+
+        let connection = store.connection.lock().unwrap();
+        let step_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM fusion_steps", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(step_count, 2);
     }
 }

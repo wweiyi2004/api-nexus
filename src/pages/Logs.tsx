@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useNavigate } from "react-router-dom";
 import {
   Activity,
   BarChart3,
@@ -7,6 +8,7 @@ import {
   Clock3,
   Download,
   Gauge,
+  GitMerge,
   KeyRound,
   RefreshCw,
   ScrollText,
@@ -31,6 +33,7 @@ export interface RequestLogEntry {
   cache_write_tokens: number;
   duration_ms: number;
   error: string | null;
+  request_body?: string | null;
 }
 
 interface Provider {
@@ -310,6 +313,7 @@ export function countLogTokens(
 }
 
 export default function Logs() {
+  const navigate = useNavigate();
   const [logs, setLogs] = useState<RequestLogEntry[]>([]);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -440,6 +444,21 @@ export default function Logs() {
 
   const tokenCountFor = (log: RequestLogEntry) =>
     countLogTokens(log, protocolFor(log));
+
+  const canReplayWithFusion = (log: RequestLogEntry) =>
+    (log.path === "/v1/chat/completions" || log.path === "/v1/messages") &&
+    Boolean(log.request_body);
+
+  const replayWithFusion = (log: RequestLogEntry) => {
+    if (!log.request_body) return;
+    navigate("/fusion", {
+      state: {
+        requestBody: log.request_body,
+        sourceLogId: log.id > 0 ? log.id : undefined,
+        path: log.path,
+      },
+    });
+  };
 
   const totals = filteredLogs.reduce(
     (acc, log) => {
@@ -893,6 +912,18 @@ export default function Logs() {
                       {log.error && (
                         <div className="mt-2 break-words rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
                           {log.error}
+                        </div>
+                      )}
+                      {(log.path === "/v1/chat/completions" || log.path === "/v1/messages") && (
+                        <div className="mt-3 flex justify-end">
+                          <button
+                            className="btn-secondary"
+                            disabled={!canReplayWithFusion(log)}
+                            onClick={() => replayWithFusion(log)}
+                          >
+                            <GitMerge className="h-4 w-4" />
+                            用 Fusion 回放
+                          </button>
                         </div>
                       )}
                     </div>

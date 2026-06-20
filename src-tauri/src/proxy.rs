@@ -17,11 +17,13 @@ use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::{AppConfig, Provider};
+use crate::fusion;
 pub use crate::storage::RequestLogEntry;
 use crate::storage::RequestLogStore;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const PROTOCOL_ANTHROPIC: &str = "anthropic";
+const MAX_STORED_REQUEST_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
@@ -86,7 +88,7 @@ pub async fn push_request_log(state: &RequestLogState, entry: RequestLogEntry) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn log_request(
+async fn log_request_with_body(
     logs: &RequestLogState,
     method: &str,
     path: &str,
@@ -98,6 +100,7 @@ async fn log_request(
     usage: TokenUsage,
     started: std::time::Instant,
     error: Option<String>,
+    request_body: Option<String>,
 ) {
     let entry = RequestLogEntry {
         id: 0,
@@ -116,6 +119,7 @@ async fn log_request(
         cache_write_tokens: usage.cache_write_tokens,
         duration_ms: started.elapsed().as_millis() as u64,
         error,
+        request_body,
     };
     push_request_log(logs, entry).await;
 }
@@ -130,6 +134,7 @@ struct RequestLogContext {
     api_key_name: String,
     status: u16,
     started: std::time::Instant,
+    request_body: Option<String>,
 }
 #[derive(Clone)]
 pub struct ProxyState {
@@ -312,7 +317,7 @@ fn resolve_model_alias<'a>(config: &'a AppConfig, model: &'a str) -> &'a str {
     model
 }
 
-fn is_anthropic_provider(provider: &Provider) -> bool {
+pub(crate) fn is_anthropic_provider(provider: &Provider) -> bool {
     provider.protocol.eq_ignore_ascii_case(PROTOCOL_ANTHROPIC)
 }
 
@@ -480,6 +485,18 @@ fn bad_gateway(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn replay_request_body(path: &str, body: &Value) -> Option<String> {
+    if !matches!(path, "/v1/chat/completions" | "/v1/messages") {
+        return None;
+    }
+    let body_text = body.to_string();
+    if body_text.len() > MAX_STORED_REQUEST_BODY_BYTES {
+        None
+    } else {
+        Some(body_text)
+    }
+}
+
 fn first_u64_field(value: &Value, field_names: &[&str]) -> u64 {
     field_names
         .iter()
@@ -508,7 +525,7 @@ fn sum_named_token_fields(value: &Value, field_names: &[&str]) -> u64 {
     }
 }
 
-fn extract_token_usage(value: &Value) -> TokenUsage {
+pub(crate) fn extract_token_usage(value: &Value) -> TokenUsage {
     let usage = value
         .get("usage")
         .or_else(|| {
@@ -612,7 +629,7 @@ async fn passthrough_response(
                 usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
             }
             record_token_usage(&token_stats, usage).await;
-            log_request(
+            log_request_with_body(
                 &request_logs,
                 log_context.method,
                 &log_context.path,
@@ -624,12 +641,13 @@ async fn passthrough_response(
                 usage,
                 log_context.started,
                 None,
+                log_context.request_body.clone(),
             )
             .await;
         } else if let Ok(body_json) = serde_json::from_slice::<Value>(&accumulated) {
             let usage = extract_token_usage(&body_json);
             record_token_usage(&token_stats, usage).await;
-            log_request(
+            log_request_with_body(
                 &request_logs,
                 log_context.method,
                 &log_context.path,
@@ -641,10 +659,11 @@ async fn passthrough_response(
                 usage,
                 log_context.started,
                 None,
+                log_context.request_body.clone(),
             )
             .await;
         } else {
-            log_request(
+            log_request_with_body(
                 &request_logs,
                 log_context.method,
                 &log_context.path,
@@ -656,6 +675,7 @@ async fn passthrough_response(
                 TokenUsage::default(),
                 log_context.started,
                 Some("Failed to parse response usage".to_string()),
+                log_context.request_body.clone(),
             )
             .await;
         }
@@ -790,7 +810,7 @@ fn normalize_anthropic_content(content: &Value) -> Value {
     }
 }
 
-fn openai_to_anthropic_request(openai: &Value) -> Result<Value, String> {
+pub(crate) fn openai_to_anthropic_request(openai: &Value) -> Result<Value, String> {
     let model = openai
         .get("model")
         .and_then(Value::as_str)
@@ -1036,7 +1056,7 @@ fn anthropic_message_to_openai_messages(message: &Value) -> Vec<Value> {
     openai_messages
 }
 
-fn anthropic_to_openai_chat_request(anthropic: &Value) -> Result<Value, String> {
+pub(crate) fn anthropic_to_openai_chat_request(anthropic: &Value) -> Result<Value, String> {
     let model = anthropic
         .get("model")
         .and_then(Value::as_str)
@@ -1564,7 +1584,7 @@ async fn openai_stream_to_anthropic_response(
         }))));
 
         record_token_usage(&token_stats, usage).await;
-        log_request(
+        log_request_with_body(
             &request_logs,
             log_context.method,
             &log_context.path,
@@ -1576,6 +1596,7 @@ async fn openai_stream_to_anthropic_response(
             usage,
             log_context.started,
             None,
+            log_context.request_body.clone(),
         )
         .await;
     };
@@ -1708,7 +1729,7 @@ async fn anthropic_stream_to_openai_response(
         }
 
         record_token_usage(&token_stats, usage).await;
-        log_request(
+        log_request_with_body(
             &request_logs,
             log_context.method,
             &log_context.path,
@@ -1720,6 +1741,7 @@ async fn anthropic_stream_to_openai_response(
             usage,
             log_context.started,
             None,
+            log_context.request_body.clone(),
         )
         .await;
     };
@@ -1797,6 +1819,108 @@ async fn anthropic_handler(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let request_body_for_log = replay_request_body(&request_path, &body_json);
+
+    if fusion::is_fusion_model(&model) {
+        if request_path != "/v1/messages" {
+            let message = "Fusion is only supported on /v1/messages".to_string();
+            log_request_with_body(
+                &state.request_logs,
+                "POST",
+                &request_path,
+                &model,
+                "Fusion",
+                "nexus-fusion",
+                &api_key_name,
+                400,
+                TokenUsage::default(),
+                started,
+                Some(message.clone()),
+                request_body_for_log.clone(),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": message
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        let config = state.config.read().await.clone();
+        match fusion::run_from_anthropic_request(
+            &state.client,
+            &state.request_logs,
+            &config,
+            &body_json,
+            None,
+        )
+        .await
+        {
+            Ok(run) => {
+                record_token_usage(&state.token_stats, run.usage).await;
+                log_request_with_body(
+                    &state.request_logs,
+                    "POST",
+                    &request_path,
+                    &model,
+                    "Fusion",
+                    "nexus-fusion",
+                    &api_key_name,
+                    200,
+                    run.usage,
+                    started,
+                    None,
+                    request_body_for_log,
+                )
+                .await;
+                return Json(fusion::anthropic_message_response(
+                    &run.final_content,
+                    run.usage,
+                ))
+                .into_response();
+            }
+            Err(error) => {
+                let status = if error.is_bad_request() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                let message = error.to_string();
+                log_request_with_body(
+                    &state.request_logs,
+                    "POST",
+                    &request_path,
+                    &model,
+                    "Fusion",
+                    "nexus-fusion",
+                    &api_key_name,
+                    status.as_u16(),
+                    TokenUsage::default(),
+                    started,
+                    Some(message.clone()),
+                    request_body_for_log,
+                )
+                .await;
+                return (
+                    status,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { "api_error" },
+                            "message": message
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     let config = state.config.read().await;
     let mut providers: Vec<_> = config
@@ -1809,7 +1933,7 @@ async fn anthropic_handler(
     drop(config);
 
     if providers.is_empty() {
-        log_request(
+        log_request_with_body(
             &state.request_logs,
             "POST",
             &request_path,
@@ -1821,6 +1945,7 @@ async fn anthropic_handler(
             TokenUsage::default(),
             started,
             Some(format!("No provider found for model: {}", model)),
+            request_body_for_log.clone(),
         )
         .await;
         return (
@@ -1867,6 +1992,7 @@ async fn anthropic_handler(
                             api_key_name: api_key_name.clone(),
                             status,
                             started,
+                            request_body: request_body_for_log.clone(),
                         },
                     )
                     .await;
@@ -1879,7 +2005,7 @@ async fn anthropic_handler(
         }
 
         if request_path == "/v1/messages/count_tokens" {
-            log_request(
+            log_request_with_body(
                 &state.request_logs,
                 "POST",
                 &request_path,
@@ -1891,6 +2017,7 @@ async fn anthropic_handler(
                 TokenUsage::default(),
                 started,
                 None,
+                request_body_for_log.clone(),
             )
             .await;
             return Json(json!({
@@ -1948,6 +2075,7 @@ async fn anthropic_handler(
                             api_key_name: api_key_name.clone(),
                             status: 200,
                             started,
+                            request_body: request_body_for_log.clone(),
                         },
                     )
                     .await;
@@ -1957,7 +2085,7 @@ async fn anthropic_handler(
                     Ok(openai_response) => {
                         let usage = extract_token_usage(&openai_response);
                         record_token_usage(&state.token_stats, usage).await;
-                        log_request(
+                        log_request_with_body(
                             &state.request_logs,
                             "POST",
                             &request_path,
@@ -1969,6 +2097,7 @@ async fn anthropic_handler(
                             usage,
                             started,
                             None,
+                            request_body_for_log.clone(),
                         )
                         .await;
                         return Json(openai_to_anthropic_response(openai_response, &model))
@@ -1990,7 +2119,7 @@ async fn anthropic_handler(
         }
     }
 
-    log_request(
+    log_request_with_body(
         &state.request_logs,
         "POST",
         &request_path,
@@ -2002,6 +2131,7 @@ async fn anthropic_handler(
         TokenUsage::default(),
         started,
         Some(errors.join("; ")),
+        request_body_for_log,
     )
     .await;
 
@@ -2079,6 +2209,103 @@ async fn proxy_handler(
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
+    let request_body_for_log = replay_request_body(&request_path, &body_json);
+
+    if fusion::is_fusion_model(&model) {
+        if request_path != "/v1/chat/completions" {
+            let message = "Fusion is only supported on /v1/chat/completions".to_string();
+            log_request_with_body(
+                &state.request_logs,
+                "POST",
+                &request_path,
+                &model,
+                "Fusion",
+                "nexus-fusion",
+                &api_key_name,
+                400,
+                TokenUsage::default(),
+                started,
+                Some(message.clone()),
+                request_body_for_log.clone(),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        let config = state.config.read().await.clone();
+        match fusion::run_from_openai_request(
+            &state.client,
+            &state.request_logs,
+            &config,
+            &body_json,
+            None,
+        )
+        .await
+        {
+            Ok(run) => {
+                record_token_usage(&state.token_stats, run.usage).await;
+                log_request_with_body(
+                    &state.request_logs,
+                    "POST",
+                    &request_path,
+                    &model,
+                    "Fusion",
+                    "nexus-fusion",
+                    &api_key_name,
+                    200,
+                    run.usage,
+                    started,
+                    None,
+                    request_body_for_log,
+                )
+                .await;
+                return Json(fusion::openai_chat_response(&run.final_content, run.usage))
+                    .into_response();
+            }
+            Err(error) => {
+                let status = if error.is_bad_request() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                let message = error.to_string();
+                log_request_with_body(
+                    &state.request_logs,
+                    "POST",
+                    &request_path,
+                    &model,
+                    "Fusion",
+                    "nexus-fusion",
+                    &api_key_name,
+                    status.as_u16(),
+                    TokenUsage::default(),
+                    started,
+                    Some(message.clone()),
+                    request_body_for_log,
+                )
+                .await;
+                return (
+                    status,
+                    Json(json!({
+                        "error": {
+                            "message": message,
+                            "type": if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { "server_error" }
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     let config = state.config.read().await;
     let mut providers: Vec<_> = config
@@ -2094,7 +2321,7 @@ async fn proxy_handler(
     drop(config);
 
     if providers.is_empty() {
-        log_request(
+        log_request_with_body(
             &state.request_logs,
             "POST",
             &request_path,
@@ -2106,6 +2333,7 @@ async fn proxy_handler(
             TokenUsage::default(),
             started,
             Some(format!("No provider found for model: {}", model)),
+            request_body_for_log.clone(),
         )
         .await;
         return (
@@ -2159,6 +2387,7 @@ async fn proxy_handler(
                                 api_key_name: api_key_name.clone(),
                                 status: 200,
                                 started,
+                                request_body: request_body_for_log.clone(),
                             },
                         )
                         .await;
@@ -2168,7 +2397,7 @@ async fn proxy_handler(
                         Ok(anthropic_response) => {
                             let usage = extract_token_usage(&anthropic_response);
                             record_token_usage(&state.token_stats, usage).await;
-                            log_request(
+                            log_request_with_body(
                                 &state.request_logs,
                                 "POST",
                                 &request_path,
@@ -2180,6 +2409,7 @@ async fn proxy_handler(
                                 usage,
                                 started,
                                 None,
+                                request_body_for_log.clone(),
                             )
                             .await;
                             return Json(anthropic_to_openai_response(anthropic_response, &model))
@@ -2237,6 +2467,7 @@ async fn proxy_handler(
                         api_key_name: api_key_name.clone(),
                         status,
                         started,
+                        request_body: request_body_for_log.clone(),
                     },
                 )
                 .await;
@@ -2248,7 +2479,7 @@ async fn proxy_handler(
         }
     }
 
-    log_request(
+    log_request_with_body(
         &state.request_logs,
         "POST",
         &request_path,
@@ -2260,6 +2491,7 @@ async fn proxy_handler(
         TokenUsage::default(),
         started,
         Some(errors.join("; ")),
+        request_body_for_log,
     )
     .await;
 
@@ -2279,9 +2511,10 @@ async fn proxy_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ModelRoute, Provider};
+    use crate::config::{FusionConfig, ModelRef, ModelRoute, Provider};
     use axum::routing::post;
     use std::net::SocketAddr;
+    use std::sync::Mutex;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
 
@@ -2312,6 +2545,47 @@ mod tests {
             protocol: "anthropic".to_string(),
             ..provider(base_url, priority)
         }
+    }
+
+    fn fusion_model_ref(model: &str) -> ModelRef {
+        ModelRef {
+            provider_id: "fusion-provider".to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    fn fusion_config() -> FusionConfig {
+        FusionConfig {
+            panel_models: vec![fusion_model_ref("panel-a"), fusion_model_ref("panel-b")],
+            judge_model: Some(fusion_model_ref("judge")),
+            final_model: Some(fusion_model_ref("final")),
+            timeout_secs: 10,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replay_request_body_only_keeps_small_replayable_requests() {
+        assert!(replay_request_body(
+            "/v1/chat/completions",
+            &json!({"model": "test-model", "messages": []})
+        )
+        .is_some());
+        assert!(replay_request_body(
+            "/v1/messages",
+            &json!({"model": "test-model", "messages": []})
+        )
+        .is_some());
+        assert!(replay_request_body(
+            "/v1/embeddings",
+            &json!({"model": "test-model", "input": "secret"})
+        )
+        .is_none());
+        assert!(replay_request_body(
+            "/v1/chat/completions",
+            &json!({"model": "test-model", "messages": [{"role": "user", "content": "x".repeat(MAX_STORED_REQUEST_BODY_BYTES)}]})
+        )
+        .is_none());
     }
 
     #[test]
@@ -2642,6 +2916,439 @@ mod tests {
         assert_eq!(stats.cached_tokens, 5);
 
         upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn openai_fusion_model_runs_panel_judge_and_final_steps() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default();
+                Json(json!({
+                    "id": format!("chatcmpl-{model}"),
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": format!("answer from {model}")},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+                }))
+                .into_response()
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let store = Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap());
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(TokenStats::default())),
+            store.clone(),
+        );
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "tools": [],
+                "tool_choice": "auto",
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["model"], "nexus/fusion");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "answer from final"
+        );
+
+        let runs = store.list_fusion_runs().await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "succeeded");
+        assert_eq!(runs[0].panel_count, 2);
+        let details = store.get_fusion_run(runs[0].id).await.unwrap().unwrap();
+        assert_eq!(details.steps.len(), 4);
+        assert_eq!(
+            details
+                .steps
+                .iter()
+                .map(|step| step.role.as_str())
+                .collect::<Vec<_>>(),
+            ["panel", "panel", "judge", "final"]
+        );
+        let logs = store.list().await;
+        assert_eq!(logs[0].model, "nexus/fusion");
+        assert!(logs[0]
+            .request_body
+            .as_deref()
+            .unwrap_or_default()
+            .contains("\"nexus/fusion\""));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn openai_fusion_final_inherits_requested_max_tokens() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    let model = body["model"].as_str().unwrap_or_default().to_string();
+                    captured.lock().unwrap().push(body);
+                    Json(json!({
+                        "id": format!("chatcmpl-{model}"),
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": format!("answer from {model}")},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "max_completion_tokens": 333,
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let _: Value = response.json().await.unwrap();
+
+        let requests = captured_requests.lock().unwrap();
+        let max_tokens_for = |model: &str| {
+            requests
+                .iter()
+                .find(|body| body["model"] == model)
+                .and_then(|body| body["max_tokens"].as_u64())
+                .unwrap()
+        };
+        assert_eq!(max_tokens_for("panel-a"), 2048);
+        assert_eq!(max_tokens_for("judge"), 2048);
+        assert_eq!(max_tokens_for("final"), 333);
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fusion_continues_when_one_panel_model_fails() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                if model == "panel-b" {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"message": "panel failed"}})),
+                    )
+                        .into_response();
+                }
+                Json(json!({
+                    "id": format!("chatcmpl-{model}"),
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": format!("answer from {model}")},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+                }))
+                .into_response()
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let store = Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap());
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(TokenStats::default())),
+            store.clone(),
+        );
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "answer from final"
+        );
+
+        let runs = store.list_fusion_runs().await.unwrap();
+        assert_eq!(runs[0].status, "succeeded");
+        assert_eq!(runs[0].panel_count, 1);
+        let details = store.get_fusion_run(runs[0].id).await.unwrap().unwrap();
+        assert_eq!(details.steps.len(), 4);
+        assert_eq!(
+            details
+                .steps
+                .iter()
+                .filter(|step| step.role == "panel" && step.status == "failed")
+                .count(),
+            1
+        );
+        assert!(details
+            .steps
+            .iter()
+            .any(|step| step.role == "final" && step.status == "succeeded"));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fusion_fails_when_all_panel_models_fail() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                if model.starts_with("panel-") {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"message": format!("{model} failed")}})),
+                    )
+                        .into_response();
+                }
+                Json(json!({
+                    "id": format!("chatcmpl-{model}"),
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": format!("answer from {model}")},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+                }))
+                .into_response()
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let store = Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap());
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(TokenStats::default())),
+            store.clone(),
+        );
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 502);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("All Fusion panel models failed"));
+
+        let runs = store.list_fusion_runs().await.unwrap();
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].panel_count, 0);
+        let details = store.get_fusion_run(runs[0].id).await.unwrap().unwrap();
+        assert_eq!(details.steps.len(), 2);
+        assert!(details
+            .steps
+            .iter()
+            .all(|step| step.role == "panel" && step.status == "failed"));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_fusion_model_returns_anthropic_message() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default();
+                Json(json!({
+                    "id": format!("chatcmpl-{model}"),
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": format!("answer from {model}")},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+                .into_response()
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&json!({
+                "model": "nexus/fusion",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["model"], "nexus/fusion");
+        assert_eq!(body["content"][0]["text"], "answer from final");
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fusion_streaming_requests_return_clear_error() {
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider("http://127.0.0.1:9".to_string(), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "stream": true,
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("streaming"));
+
         proxy_task.abort();
     }
 

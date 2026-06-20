@@ -1,4 +1,5 @@
 use crate::config::{self, AppConfig, Provider};
+use crate::fusion;
 use crate::proxy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,42 @@ pub async fn export_request_logs_csv(
     std::fs::write(&path, state.request_logs.export_csv().await)
         .map_err(|error| error.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn run_fusion(
+    state: tauri::State<'_, Arc<AppState>>,
+    request: fusion::FusionWorkbenchRequest,
+) -> Result<crate::storage::FusionRunDetails, String> {
+    let config = state.config.read().await.clone();
+    let run = fusion::run_workbench(&state.client, &state.request_logs, &config, request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(run.details)
+}
+
+#[tauri::command]
+pub async fn get_fusion_runs(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::storage::FusionRunEntry>, String> {
+    state.request_logs.list_fusion_runs().await
+}
+
+#[tauri::command]
+pub async fn get_fusion_run(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<crate::storage::FusionRunDetails, String> {
+    state
+        .request_logs
+        .get_fusion_run(id)
+        .await?
+        .ok_or_else(|| format!("Fusion run not found: {id}"))
+}
+
+#[tauri::command]
+pub async fn clear_fusion_runs(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.request_logs.clear_fusion_runs().await
 }
 
 pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, String> {

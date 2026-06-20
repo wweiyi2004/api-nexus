@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Boxes, GripVertical, Loader2, Route, Search } from "lucide-react";
 
@@ -37,12 +37,61 @@ interface ModelInfo {
   }[];
 }
 
+type DropPosition = "before" | "after";
+
+interface DraggedRoute {
+  modelName: string;
+  providerId: string;
+}
+
+interface DropTarget extends DraggedRoute {
+  position: DropPosition;
+}
+
+const dragPayloadType = "application/x-api-nexus-model-route";
+
+function isDraggedRoute(value: unknown): value is DraggedRoute {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.modelName === "string" && typeof record.providerId === "string";
+}
+
+function encodeDraggedRoute(route: DraggedRoute) {
+  return JSON.stringify(route);
+}
+
+function readDraggedRoute(
+  event: DragEvent<HTMLElement>,
+  fallback: DraggedRoute | null,
+): DraggedRoute | null {
+  const payload =
+    event.dataTransfer.getData(dragPayloadType) ||
+    event.dataTransfer.getData("text/plain");
+
+  if (payload) {
+    try {
+      const parsed: unknown = JSON.parse(payload);
+      if (isDraggedRoute(parsed)) return parsed;
+    } catch {
+      if (fallback) return { ...fallback, providerId: payload };
+    }
+  }
+
+  return fallback;
+}
+
+function dropPositionFor(event: DragEvent<HTMLElement>): DropPosition {
+  const rect = event.currentTarget.getBoundingClientRect();
+  return event.clientY <= rect.top + rect.height / 2 ? "before" : "after";
+}
+
 export function reorderModelRoutes(
   routes: ModelRoute[],
   model: string,
   routeProviderIds: string[],
   sourceId: string,
   targetId: string,
+  position: DropPosition = "before",
 ) {
   if (sourceId === targetId) return routes;
 
@@ -52,7 +101,14 @@ export function reorderModelRoutes(
 
   const reorderedRouteIds = [...routeProviderIds];
   const [movedId] = reorderedRouteIds.splice(sourceIndex, 1);
-  reorderedRouteIds.splice(targetIndex, 0, movedId);
+  const updatedTargetIndex = reorderedRouteIds.indexOf(targetId);
+  if (updatedTargetIndex < 0) return routes;
+
+  reorderedRouteIds.splice(
+    position === "after" ? updatedTargetIndex + 1 : updatedTargetIndex,
+    0,
+    movedId,
+  );
 
   const existingIndex = routes.findIndex((route) => route.model === model);
   if (existingIndex < 0) {
@@ -67,10 +123,9 @@ export function reorderModelRoutes(
 export default function Models() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [query, setQuery] = useState("");
-  const [draggedRoute, setDraggedRoute] = useState<{
-    modelName: string;
-    providerId: string;
-  } | null>(null);
+  const draggedRouteRef = useRef<DraggedRoute | null>(null);
+  const [draggedRoute, setDraggedRoute] = useState<DraggedRoute | null>(null);
+  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [savingPriority, setSavingPriority] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -123,21 +178,32 @@ export default function Models() {
       .filter((model) => model.name.toLowerCase().includes(query.toLowerCase()));
   }, [config, query]);
 
-  const moveProvider = async (modelName: string, targetProviderId: string) => {
+  const clearDragState = () => {
+    draggedRouteRef.current = null;
+    setDraggedRoute(null);
+    setDropTarget(null);
+  };
+
+  const moveProvider = async (
+    modelName: string,
+    targetProviderId: string,
+    position: DropPosition,
+    sourceRoute: DraggedRoute | null,
+  ) => {
     if (
       !config ||
-      !draggedRoute ||
-      draggedRoute.modelName !== modelName ||
-      draggedRoute.providerId === targetProviderId ||
+      !sourceRoute ||
+      sourceRoute.modelName !== modelName ||
+      sourceRoute.providerId === targetProviderId ||
       savingPriority
     ) {
-      setDraggedRoute(null);
+      clearDragState();
       return;
     }
 
     const model = models.find((item) => item.name === modelName);
     if (!model) {
-      setDraggedRoute(null);
+      clearDragState();
       return;
     }
 
@@ -148,12 +214,13 @@ export default function Models() {
         config.model_routes ?? [],
         modelName,
         model.providers.map((provider) => provider.id),
-        draggedRoute.providerId,
+        sourceRoute.providerId,
         targetProviderId,
+        position,
       ),
     };
 
-    setDraggedRoute(null);
+    clearDragState();
     setError(null);
     setSavingPriority(true);
     setConfig(nextConfig);
@@ -228,53 +295,112 @@ export default function Models() {
                   </div>
 
                   <div className="min-w-[360px] flex-1 space-y-2">
-                    {model.providers.map((provider, index) => (
-                      <div
-                        key={provider.id}
-                        data-testid="provider-route"
-                        data-provider-id={provider.id}
-                        draggable={!savingPriority}
-                        onDragStart={(event) => {
-                          event.dataTransfer.effectAllowed = "move";
-                          event.dataTransfer.setData("text/plain", provider.id);
-                          setDraggedRoute({ modelName: model.name, providerId: provider.id });
-                        }}
-                        onDragOver={(event) => {
-                          if (draggedRoute?.modelName === model.name && !savingPriority) {
+                    {model.providers.map((provider, index) => {
+                      const isDragging =
+                        draggedRoute?.modelName === model.name &&
+                        draggedRoute.providerId === provider.id;
+                      const isDropTarget =
+                        dropTarget?.modelName === model.name &&
+                        dropTarget.providerId === provider.id &&
+                        draggedRoute?.providerId !== provider.id;
+
+                      return (
+                        <div
+                          key={provider.id}
+                          data-testid="provider-route"
+                          data-provider-id={provider.id}
+                          draggable={!savingPriority}
+                          onDragStart={(event) => {
+                            const route = { modelName: model.name, providerId: provider.id };
+                            draggedRouteRef.current = route;
+                            setDraggedRoute(route);
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData(dragPayloadType, encodeDraggedRoute(route));
+                            event.dataTransfer.setData("text/plain", encodeDraggedRoute(route));
+                          }}
+                          onDragOver={(event) => {
+                            const sourceRoute = readDraggedRoute(event, draggedRouteRef.current);
+                            if (
+                              !sourceRoute ||
+                              sourceRoute.modelName !== model.name ||
+                              sourceRoute.providerId === provider.id ||
+                              savingPriority
+                            ) {
+                              return;
+                            }
+
                             event.preventDefault();
                             event.dataTransfer.dropEffect = "move";
-                          }
-                        }}
-                        onDrop={(event) => {
-                          event.preventDefault();
-                          void moveProvider(model.name, provider.id);
-                        }}
-                        onDragEnd={() => setDraggedRoute(null)}
-                        className={`flex items-center gap-3 rounded-lg border px-3 py-2 text-sm transition-colors ${
-                          draggedRoute?.providerId === provider.id
-                            ? "border-cyan-400 bg-cyan-50 opacity-60 dark:border-cyan-600 dark:bg-cyan-950/30"
-                            : "cursor-grab border-transparent bg-surface-50 hover:border-surface-300 active:cursor-grabbing dark:bg-surface-950 dark:hover:border-surface-700"
-                        }`}
-                      >
-                        <GripVertical
-                          className="h-4 w-4 shrink-0 text-surface-400"
-                          aria-label="拖动调整优先级"
-                        />
-                        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-white text-xs font-semibold text-surface-600 ring-1 ring-surface-200 dark:bg-surface-900 dark:text-surface-300 dark:ring-surface-700">
-                          {index + 1}
-                        </span>
-                        <Route className="h-4 w-4 shrink-0 text-surface-400" />
-                        <span className="min-w-0 flex-1 truncate text-surface-700 dark:text-surface-200">
-                          {provider.name || "未命名服务商"}
-                        </span>
-                        <span className="badge badge-info">
-                          {provider.protocol === "anthropic" ? "Anthropic" : "OpenAI"}
-                        </span>
-                        <span className={provider.enabled ? "badge badge-success" : "badge badge-neutral"}>
-                          {provider.enabled ? "启用" : "禁用"}
-                        </span>
-                      </div>
-                    ))}
+                            const position = dropPositionFor(event);
+                            setDropTarget((current) => {
+                              if (
+                                current?.modelName === model.name &&
+                                current.providerId === provider.id &&
+                                current.position === position
+                              ) {
+                                return current;
+                              }
+                              return { modelName: model.name, providerId: provider.id, position };
+                            });
+                          }}
+                          onDragLeave={(event) => {
+                            const relatedTarget = event.relatedTarget;
+                            if (
+                              relatedTarget instanceof Node &&
+                              event.currentTarget.contains(relatedTarget)
+                            ) {
+                              return;
+                            }
+                            setDropTarget((current) =>
+                              current?.modelName === model.name && current.providerId === provider.id
+                                ? null
+                                : current,
+                            );
+                          }}
+                          onDrop={(event) => {
+                            event.preventDefault();
+                            const sourceRoute = readDraggedRoute(event, draggedRouteRef.current);
+                            void moveProvider(
+                              model.name,
+                              provider.id,
+                              dropPositionFor(event),
+                              sourceRoute,
+                            );
+                          }}
+                          onDragEnd={clearDragState}
+                          className={`relative flex items-center gap-3 rounded-lg border px-3 py-2 text-sm transition-colors ${
+                            isDragging
+                              ? "border-cyan-400 bg-cyan-50 opacity-60 dark:border-cyan-600 dark:bg-cyan-950/30"
+                              : "cursor-grab border-transparent bg-surface-50 hover:border-surface-300 active:cursor-grabbing dark:bg-surface-950 dark:hover:border-surface-700"
+                          }`}
+                        >
+                          {isDropTarget && (
+                            <span
+                              className={`pointer-events-none absolute left-2 right-2 h-0.5 rounded-full bg-cyan-500 ${
+                                dropTarget?.position === "before" ? "-top-1" : "-bottom-1"
+                              }`}
+                            />
+                          )}
+                          <GripVertical
+                            className="h-4 w-4 shrink-0 text-surface-400"
+                            aria-label="拖动调整优先级"
+                          />
+                          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-white text-xs font-semibold text-surface-600 ring-1 ring-surface-200 dark:bg-surface-900 dark:text-surface-300 dark:ring-surface-700">
+                            {index + 1}
+                          </span>
+                          <Route className="h-4 w-4 shrink-0 text-surface-400" />
+                          <span className="min-w-0 flex-1 truncate text-surface-700 dark:text-surface-200">
+                            {provider.name || "未命名服务商"}
+                          </span>
+                          <span className="badge badge-info">
+                            {provider.protocol === "anthropic" ? "Anthropic" : "OpenAI"}
+                          </span>
+                          <span className={provider.enabled ? "badge badge-success" : "badge badge-neutral"}>
+                            {provider.enabled ? "启用" : "禁用"}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

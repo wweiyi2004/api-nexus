@@ -49,6 +49,17 @@ test.beforeEach(async ({ page }) => {
       usd_to_cny_rate: 7.2,
       log_retention_days: 30,
       max_log_entries: 10000,
+      fusion: {
+        enabled: true,
+        panel_models: [
+          { provider_id: "provider-a", model: "shared-model" },
+          { provider_id: "provider-c", model: "shared-model" },
+        ],
+        judge_model: { provider_id: "provider-a", model: "other-model" },
+        final_model: null,
+        max_panel_models: 4,
+        timeout_secs: 120,
+      },
     };
     Object.defineProperty(window, "__TEST_CONFIG__", { get: () => config });
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
@@ -72,6 +83,27 @@ test.beforeEach(async ({ page }) => {
           };
         }
         if (command === "get_request_logs") return [];
+        if (command === "get_fusion_runs") return [];
+        if (command === "get_fusion_run") return null;
+        if (command === "clear_fusion_runs") return null;
+        if (command === "run_fusion") {
+          return {
+            run: {
+              id: 1,
+              created_at: Math.floor(Date.now() / 1000),
+              source_log_id: null,
+              input_protocol: "openai",
+              status: "succeeded",
+              duration_ms: 100,
+              panel_count: 2,
+              total_tokens: 12,
+              estimated_cost: 0,
+              final_content: "mock fusion result",
+              error: null,
+            },
+            steps: [],
+          };
+        }
         return null;
       },
     };
@@ -85,6 +117,9 @@ test("navigates through dashboard, logs and settings", async ({ page }) => {
   await page.getByRole("link", { name: "请求日志" }).click();
   await expect(page.getByRole("heading", { name: "请求日志" })).toBeVisible();
   await expect(page.getByText("暂无请求记录")).toBeVisible();
+
+  await page.getByRole("link", { name: "Fusion" }).click();
+  await expect(page.getByRole("heading", { name: "Fusion" })).toBeVisible();
 
   await page.getByRole("link", { name: "设置" }).click();
   await expect(page.getByRole("heading", { name: "设置" })).toBeVisible();
@@ -103,11 +138,27 @@ test("reorders only the selected model route", async ({ page }) => {
   const otherModel = page.locator(".data-row").filter({ hasText: "other-model" });
   await expect(otherModel.getByTestId("provider-route").nth(0)).toContainText("Other Route");
 
-  await routes.nth(1).dragTo(routes.nth(0));
+  const sharedFirstBox = await routes.nth(0).boundingBox();
+  expect(sharedFirstBox).not.toBeNull();
+  await routes.nth(1).dragTo(routes.nth(0), {
+    targetPosition: { x: 20, y: 4 },
+  });
 
   await expect(sharedModel.getByTestId("provider-route").nth(0)).toContainText("Anthropic Route");
   await expect(otherModel.getByTestId("provider-route").nth(0)).toContainText("Other Route");
-  await expect(sharedModel.getByText("正在保存")).toHaveCount(0);
+
+  const otherRoutes = otherModel.getByTestId("provider-route");
+  const otherSecondBox = await otherRoutes.nth(1).boundingBox();
+  expect(otherSecondBox).not.toBeNull();
+  await otherRoutes.nth(0).dragTo(otherRoutes.nth(1), {
+    targetPosition: {
+      x: 20,
+      y: Math.max(1, Math.floor(otherSecondBox!.height - 4)),
+    },
+  });
+
+  await expect(otherModel.getByTestId("provider-route").nth(0)).toContainText("OpenAI Route");
+  await expect(page.getByText("正在保存")).toHaveCount(0);
 
   const savedRoutes = await page.evaluate(() =>
     (window as unknown as {
@@ -116,6 +167,6 @@ test("reorders only the selected model route", async ({ page }) => {
   );
   expect(savedRoutes).toEqual([
     { model: "shared-model", provider_ids: ["provider-c", "provider-a"] },
-    { model: "other-model", provider_ids: ["provider-b", "provider-a"] },
+    { model: "other-model", provider_ids: ["provider-a", "provider-b"] },
   ]);
 });
