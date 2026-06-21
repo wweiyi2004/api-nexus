@@ -1856,7 +1856,11 @@ async fn prepare_request(
 /// If `prepared.model` is a fusion model, run the fusion pipeline for this
 /// dialect and return its (already-logged) response. Returns `None` when the
 /// model is not a fusion model, leaving normal provider routing to the caller.
-async fn try_fusion(state: &ProxyState, dialect: ApiDialect, prepared: &Prepared) -> Option<Response> {
+async fn try_fusion(
+    state: &ProxyState,
+    dialect: ApiDialect,
+    prepared: &Prepared,
+) -> Option<Response> {
     if !fusion::is_fusion_model(&prepared.model) {
         return None;
     }
@@ -1944,9 +1948,7 @@ async fn try_fusion(state: &ProxyState, dialect: ApiDialect, prepared: &Prepared
             log_request_with_body(&state.request_logs, &fusion_log(200), usage, None).await;
             let body = match dialect {
                 ApiDialect::OpenAI => fusion::openai_chat_response(&final_content, usage),
-                ApiDialect::Anthropic => {
-                    fusion::anthropic_message_response(&final_content, usage)
-                }
+                ApiDialect::Anthropic => fusion::anthropic_message_response(&final_content, usage),
             };
             Some(Json(body).into_response())
         }
@@ -2969,8 +2971,11 @@ mod tests {
             providers: vec![Provider {
                 id: "fusion-provider".to_string(),
                 models: vec![
-                    "panel-a".to_string(), "panel-b".to_string(), "judge".to_string(),
-                    "final".to_string(), "outer".to_string(),
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                    "outer".to_string(),
                 ],
                 ..provider(format!("http://{}", upstream_addr), 0)
             }],
@@ -2996,7 +3001,10 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 200);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["choices"][0]["message"]["content"], "direct from outer");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "direct from outer"
+        );
         assert!(store.list_fusion_runs().await.unwrap().is_empty());
         upstream_task.abort();
         proxy_task.abort();
@@ -3013,9 +3021,9 @@ mod tests {
                 async move {
                     captured.lock().unwrap().push(body.clone());
                     let model = body["model"].as_str().unwrap_or_default();
-                    let has_tool_result = body["messages"]
-                        .as_array()
-                        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+                    let has_tool_result = body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| message["role"] == "tool")
+                    });
                     let message = if model == "outer" && !has_tool_result {
                         json!({"role": "assistant", "content": null, "tool_calls": [{
                             "id": "fusion_1", "type": "function", "function": {
@@ -3040,8 +3048,11 @@ mod tests {
             providers: vec![Provider {
                 id: "fusion-provider".to_string(),
                 models: vec![
-                    "panel-a".to_string(), "panel-b".to_string(), "judge".to_string(),
-                    "final".to_string(), "outer".to_string(),
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                    "outer".to_string(),
                 ],
                 ..provider(format!("http://{}", upstream_addr), 0)
             }],
@@ -3068,7 +3079,10 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 200);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["choices"][0]["message"]["content"], "outer synthesized answer");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "outer synthesized answer"
+        );
         {
             let requests = captured_requests.lock().unwrap();
             let first_outer = requests
@@ -3086,7 +3100,11 @@ mod tests {
         assert_eq!(runs.len(), 1);
         let details = store.get_fusion_run(runs[0].id).await.unwrap().unwrap();
         assert_eq!(
-            details.steps.iter().map(|step| step.role.as_str()).collect::<Vec<_>>(),
+            details
+                .steps
+                .iter()
+                .map(|step| step.role.as_str())
+                .collect::<Vec<_>>(),
             ["panel", "panel", "judge"]
         );
         upstream_task.abort();
@@ -4040,7 +4058,10 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 404);
         let body: Value = response.json().await.unwrap();
-        assert!(body.get("type").is_none(), "OpenAI body has no top-level type");
+        assert!(
+            body.get("type").is_none(),
+            "OpenAI body has no top-level type"
+        );
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(
             body["error"]["message"],
@@ -4095,7 +4116,10 @@ mod tests {
 
         assert_eq!(response.status().as_u16(), 502);
         let body: Value = response.json().await.unwrap();
-        assert!(body.get("type").is_none(), "OpenAI body has no top-level type");
+        assert!(
+            body.get("type").is_none(),
+            "OpenAI body has no top-level type"
+        );
         assert_eq!(body["error"]["message"], "All providers failed");
         assert_eq!(body["error"]["type"], "server_error");
         assert!(body["error"]["details"].is_array());
