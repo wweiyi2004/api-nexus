@@ -102,6 +102,7 @@ name = "api-nexus"
 version = "1.2.3"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "chrono",
  "dirs 5.0.1",
