@@ -4,7 +4,7 @@ API Nexus is a local API gateway for routing AI model requests through OpenAI-co
 
 ## Features
 
-- OpenAI-compatible entrypoint: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
+- OpenAI-compatible entrypoint: `/v1/responses`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
 - Anthropic-compatible entrypoint: `/v1/messages`, `/v1/messages/count_tokens`
 - Bidirectional protocol conversion between OpenAI chat completions and Anthropic messages
 - Per-model provider priority routing with drag-and-drop ordering and fallback
@@ -104,3 +104,27 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:11434
 ```
 
 Use the proxy API key configured in API Nexus as the client API key.
+
+### Codex CLI
+
+API Nexus Fusion can be used as a Codex custom model provider over the Responses API. Add this to `%USERPROFILE%\.codex\config.toml` (Windows) or `~/.codex/config.toml`:
+
+```toml
+model = "nexus/fusion"
+model_provider = "api_nexus"
+
+[model_providers.api_nexus]
+name = "API Nexus Fusion"
+base_url = "http://127.0.0.1:11434/v1"
+env_key = "API_NEXUS_KEY"
+wire_api = "responses"
+```
+
+Set the configured API Nexus proxy key before starting Codex:
+
+```powershell
+$env:API_NEXUS_KEY = "sk-nexus-your-key"
+codex
+```
+
+Codex CLI `0.141.0` is covered by a real CLI integration test, including a client-side `shell_command` call and follow-up `function_call_output`. Fusion supports Codex function tools, custom tools, and namespace-contained function/custom tools. OpenAI-hosted tools are not forwarded to generic inner providers.

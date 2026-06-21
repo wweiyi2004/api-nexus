@@ -52,6 +52,19 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, call: &ToolCall) -> Result<String, String>;
 }
 
+#[derive(Clone, Debug)]
+pub enum ToolLoopOutcome {
+    Text {
+        content: String,
+        usage: TokenUsage,
+    },
+    ClientToolCalls {
+        text: Option<String>,
+        calls: Vec<ToolCall>,
+        usage: TokenUsage,
+    },
+}
+
 /// Extract assistant text and tool calls from an OpenAI chat-completions
 /// response (`choices[0].message.{content,tool_calls}`).
 pub fn parse_openai_tool_calls(response: &Value) -> (Option<String>, Vec<ToolCall>) {
@@ -245,13 +258,50 @@ pub async fn run_tool_loop_with_required_tool(
     provider: &Provider,
     model: &str,
     system: Option<&str>,
-    mut messages: Vec<Value>,
+    messages: Vec<Value>,
     max_tokens: u64,
     tools: &[ToolSpec],
     executor: &dyn ToolExecutor,
     max_tool_calls: u32,
     require_tool: bool,
 ) -> Result<(String, TokenUsage), String> {
+    match run_mixed_tool_loop(
+        client,
+        provider,
+        model,
+        system,
+        messages,
+        max_tokens,
+        tools,
+        executor,
+        max_tool_calls,
+        require_tool,
+        &[],
+    )
+    .await?
+    {
+        ToolLoopOutcome::Text { content, usage } => Ok((content, usage)),
+        ToolLoopOutcome::ClientToolCalls { .. } => {
+            Err("unexpected client tool call in server-only loop".to_string())
+        }
+    }
+}
+
+/// Drive server tools internally while returning client-owned calls to the caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_mixed_tool_loop(
+    client: &reqwest::Client,
+    provider: &Provider,
+    model: &str,
+    system: Option<&str>,
+    mut messages: Vec<Value>,
+    max_tokens: u64,
+    tools: &[ToolSpec],
+    executor: &dyn ToolExecutor,
+    max_tool_calls: u32,
+    require_tool: bool,
+    client_tool_names: &[String],
+) -> Result<ToolLoopOutcome, String> {
     let anthropic = proxy::is_anthropic_provider(provider);
     let mut usage = TokenUsage::default();
     let mut executed_calls = 0_u32;
@@ -263,6 +313,9 @@ pub async fn run_tool_loop_with_required_tool(
         } else {
             openai_request_body(model, &messages, max_tokens, tools)
         };
+        if !anthropic && !tools.is_empty() {
+            request_body["parallel_tool_calls"] = Value::Bool(false);
+        }
         if require_tool && executed_calls == 0 && !tools.is_empty() {
             request_body["tool_choice"] = if anthropic {
                 json!({"type": "any"})
@@ -310,8 +363,26 @@ pub async fn run_tool_loop_with_required_tool(
         if calls.is_empty() {
             return best_text
                 .filter(|content| !content.trim().is_empty())
-                .map(|content| (content, usage))
+                .map(|content| ToolLoopOutcome::Text { content, usage })
                 .ok_or_else(|| "empty model response".to_string());
+        }
+
+        let client_calls = calls
+            .iter()
+            .filter(|call| client_tool_names.iter().any(|name| name == &call.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !client_calls.is_empty() {
+            if client_calls.len() != calls.len() {
+                return Err(
+                    "model returned server and client tool calls in one parallel batch".to_string(),
+                );
+            }
+            return Ok(ToolLoopOutcome::ClientToolCalls {
+                text: best_text,
+                calls: client_calls,
+                usage,
+            });
         }
 
         let call_count = u32::try_from(calls.len()).unwrap_or(u32::MAX);
@@ -321,7 +392,7 @@ pub async fn run_tool_loop_with_required_tool(
         {
             return best_text
                 .filter(|content| !content.trim().is_empty())
-                .map(|content| (content, usage))
+                .map(|content| ToolLoopOutcome::Text { content, usage })
                 .ok_or_else(|| "exceeded max_tool_calls".to_string());
         }
 
@@ -663,6 +734,51 @@ mod tests {
         assert_eq!(requests[1]["messages"][1]["tool_calls"][0]["id"], "call_1");
         assert_eq!(requests[1]["messages"][2]["tool_call_id"], "call_1");
         assert_eq!(requests[1]["messages"][2]["content"], "fetched page");
+    }
+
+    #[tokio::test]
+    async fn mixed_loop_returns_client_tool_without_executing_it() {
+        let (base_url, _) = spawn_model_server(vec![json!({
+            "choices": [{"message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_shell", "type": "function", "function": {
+                    "name": "shell_command", "arguments": "{\"command\":\"rg --files\"}"
+                }}]
+            }}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+        })])
+        .await;
+        let executor = RecordingExecutor::default();
+        let client_tool = ToolSpec {
+            name: "shell_command".into(),
+            description: "Run a command".into(),
+            input_schema: json!({"type": "object"}),
+        };
+        let outcome = run_mixed_tool_loop(
+            &reqwest::Client::new(),
+            &provider(base_url, "openai"),
+            "model",
+            None,
+            vec![json!({"role": "user", "content": "inspect"})],
+            100,
+            &[client_tool],
+            &executor,
+            0,
+            false,
+            &["shell_command".to_string()],
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            ToolLoopOutcome::ClientToolCalls { calls, usage, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "shell_command");
+                assert_eq!(calls[0].arguments, json!({"command": "rg --files"}));
+                assert_eq!(usage.input_tokens, 2);
+            }
+            ToolLoopOutcome::Text { .. } => panic!("expected a client tool call"),
+        }
+        assert!(executor.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

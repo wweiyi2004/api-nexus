@@ -3,6 +3,7 @@ use crate::config::{
     normalize_model_ref, normalize_model_refs, AppConfig, ModelPrice, ModelRef, Provider,
 };
 use crate::proxy::{self, TokenUsage};
+use crate::responses::{ClientTool, ParsedResponsesRequest};
 use crate::storage::{FusionRunDetails, FusionStepEntry, RequestLogStore};
 use crate::web_tools::WebTools;
 use futures::future::join_all;
@@ -90,6 +91,13 @@ pub struct CompletedFusionRun {
 pub struct CompletedOnDemandRun {
     pub usage: TokenUsage,
     pub final_content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedResponsesTurn {
+    pub text: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +344,282 @@ pub async fn run_on_demand_from_anthropic_request(
         anthropic_requires_tool(body),
     )
     .await
+}
+
+pub async fn run_from_responses_request(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    request: ParsedResponsesRequest,
+) -> Result<CompletedResponsesTurn, FusionError> {
+    if config.fusion.mode == "on_demand" {
+        run_on_demand_responses(client, store, config, request).await
+    } else {
+        run_forced_responses(client, store, config, request).await
+    }
+}
+
+async fn run_forced_responses(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    request: ParsedResponsesRequest,
+) -> Result<CompletedResponsesTurn, FusionError> {
+    let analysis = run_with_messages(
+        client,
+        store,
+        config,
+        "responses".to_string(),
+        None,
+        request.messages.clone(),
+        None,
+        None,
+        false,
+    )
+    .await?;
+    let resolved = resolve_fusion_models(config, None).map_err(FusionError::bad_request)?;
+    let mut final_messages = with_system_message(
+        &request.messages,
+        "You are API Nexus Fusion's final coding model. Use the judge analysis to continue the Codex turn. Call a client tool when repository inspection or modification is needed; otherwise answer the user directly.",
+    );
+    final_messages.push(json!({
+        "role": "user",
+        "content": format!("Fusion judge analysis:\n{}", analysis.final_content)
+    }));
+    let final_started = Instant::now();
+    let outcome = run_client_capable_model(
+        client,
+        &resolved.final_model,
+        final_messages,
+        request.max_output_tokens,
+        &[],
+        &request.client_tools,
+        &NO_TOOLS_EXECUTOR,
+        0,
+        request.require_tool,
+    )
+    .await;
+    let final_latency_ms = final_started.elapsed().as_millis() as u64;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            store
+                .push_fusion_step(FusionStepEntry {
+                    id: 0,
+                    run_id: analysis.details.run.id,
+                    role: "final".to_string(),
+                    provider_id: resolved.final_model.model_ref.provider_id.clone(),
+                    model: resolved.final_model.model_ref.model.clone(),
+                    status: "failed".to_string(),
+                    latency_ms: final_latency_ms,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cost: 0.0,
+                    content: None,
+                    error: Some(error.clone()),
+                })
+                .await
+                .map_err(FusionError::upstream)?;
+            store
+                .finish_fusion_run(
+                    analysis.details.run.id,
+                    "failed",
+                    analysis
+                        .details
+                        .run
+                        .duration_ms
+                        .saturating_add(final_latency_ms),
+                    analysis.details.run.panel_count,
+                    analysis.details.run.total_tokens,
+                    analysis.details.run.estimated_cost,
+                    None,
+                    Some(&error),
+                )
+                .await
+                .map_err(FusionError::upstream)?;
+            return Err(FusionError::upstream(error));
+        }
+    };
+    let final_usage = tool_loop_usage(&outcome);
+    let final_cost = estimate_cost(
+        config,
+        &resolved.final_model.provider,
+        &resolved.final_model.model_ref.model,
+        final_usage,
+    );
+    let final_content = tool_loop_log_content(&outcome);
+    store
+        .push_fusion_step(FusionStepEntry {
+            id: 0,
+            run_id: analysis.details.run.id,
+            role: "final".to_string(),
+            provider_id: resolved.final_model.model_ref.provider_id.clone(),
+            model: resolved.final_model.model_ref.model.clone(),
+            status: "succeeded".to_string(),
+            latency_ms: final_latency_ms,
+            prompt_tokens: final_usage.input_tokens,
+            completion_tokens: final_usage.output_tokens,
+            cost: final_cost,
+            content: Some(final_content.clone()),
+            error: None,
+        })
+        .await
+        .map_err(FusionError::upstream)?;
+    store
+        .finish_fusion_run(
+            analysis.details.run.id,
+            "succeeded",
+            analysis
+                .details
+                .run
+                .duration_ms
+                .saturating_add(final_latency_ms),
+            analysis.details.run.panel_count,
+            analysis
+                .details
+                .run
+                .total_tokens
+                .saturating_add(final_usage.input_tokens)
+                .saturating_add(final_usage.output_tokens),
+            analysis.details.run.estimated_cost + final_cost,
+            Some(&final_content),
+            None,
+        )
+        .await
+        .map_err(FusionError::upstream)?;
+    Ok(completed_responses_turn(outcome, analysis.usage))
+}
+
+async fn run_on_demand_responses(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    request: ParsedResponsesRequest,
+) -> Result<CompletedResponsesTurn, FusionError> {
+    if !config.fusion.enabled {
+        return Err(FusionError::bad_request("Fusion is disabled in settings"));
+    }
+    let outer_ref = config
+        .fusion
+        .outer_model
+        .clone()
+        .ok_or_else(|| FusionError::bad_request("Fusion outer model is not configured"))?;
+    if is_fusion_model(&outer_ref.model) {
+        return Err(FusionError::bad_request(
+            "Fusion outer model cannot be nexus/fusion",
+        ));
+    }
+    let outer = resolve_model_ref(config, outer_ref).map_err(FusionError::bad_request)?;
+    let outer_messages = with_system_message(
+        &request.messages,
+        "You are the outer coding model for API Nexus Fusion. Answer the Codex turn directly or call a Codex client tool. Call the server-side fusion tool when independent panel analysis would materially improve correctness. Never return the fusion tool to the client.",
+    );
+    let executor = FusionToolExecutor {
+        client: client.clone(),
+        store: store.clone(),
+        config: config.clone(),
+        input_protocol: "responses".to_string(),
+        messages: request.messages,
+        overrides: None,
+        usage: tokio::sync::Mutex::new(TokenUsage::default()),
+    };
+    let outcome = run_client_capable_model(
+        client,
+        &outer,
+        outer_messages,
+        request.max_output_tokens,
+        &[fusion_tool_spec()],
+        &request.client_tools,
+        &executor,
+        1,
+        request.require_tool,
+    )
+    .await
+    .map_err(FusionError::upstream)?;
+    let mut server_usage = TokenUsage::default();
+    add_token_usage(&mut server_usage, *executor.usage.lock().await);
+    Ok(completed_responses_turn(outcome, server_usage))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_client_capable_model(
+    client: &Client,
+    target: &ResolvedModel,
+    messages: Vec<Value>,
+    max_tokens: u64,
+    server_tools: &[ToolSpec],
+    client_tools: &[ClientTool],
+    executor: &dyn ToolExecutor,
+    max_server_tool_calls: u32,
+    require_tool: bool,
+) -> Result<agentic::ToolLoopOutcome, String> {
+    let mut specs = server_tools.to_vec();
+    specs.extend(client_tools.iter().map(|tool| tool.spec.clone()));
+    let client_names = client_tools
+        .iter()
+        .map(|tool| tool.exposed_name.clone())
+        .collect::<Vec<_>>();
+    let (system, messages) = messages_for_provider(target, messages, max_tokens)?;
+    agentic::run_mixed_tool_loop(
+        client,
+        &target.provider,
+        &target.model_ref.model,
+        system.as_deref(),
+        messages,
+        max_tokens,
+        &specs,
+        executor,
+        max_server_tool_calls,
+        require_tool,
+        &client_names,
+    )
+    .await
+}
+
+fn completed_responses_turn(
+    outcome: agentic::ToolLoopOutcome,
+    mut accumulated_usage: TokenUsage,
+) -> CompletedResponsesTurn {
+    match outcome {
+        agentic::ToolLoopOutcome::Text { content, usage } => {
+            add_token_usage(&mut accumulated_usage, usage);
+            CompletedResponsesTurn {
+                text: Some(content),
+                tool_calls: Vec::new(),
+                usage: accumulated_usage,
+            }
+        }
+        agentic::ToolLoopOutcome::ClientToolCalls { text, calls, usage } => {
+            add_token_usage(&mut accumulated_usage, usage);
+            CompletedResponsesTurn {
+                text,
+                tool_calls: calls,
+                usage: accumulated_usage,
+            }
+        }
+    }
+}
+
+fn tool_loop_usage(outcome: &agentic::ToolLoopOutcome) -> TokenUsage {
+    match outcome {
+        agentic::ToolLoopOutcome::Text { usage, .. }
+        | agentic::ToolLoopOutcome::ClientToolCalls { usage, .. } => *usage,
+    }
+}
+
+fn tool_loop_log_content(outcome: &agentic::ToolLoopOutcome) -> String {
+    match outcome {
+        agentic::ToolLoopOutcome::Text { content, .. } => content.clone(),
+        agentic::ToolLoopOutcome::ClientToolCalls { text, calls, .. } => json!({
+            "text": text,
+            "tool_calls": calls.iter().map(|call| json!({
+                "id": call.id,
+                "name": call.name,
+                "arguments": call.arguments
+            })).collect::<Vec<_>>()
+        })
+        .to_string(),
+    }
 }
 
 fn reject_on_demand_request(body: &Value) -> Result<(), FusionError> {

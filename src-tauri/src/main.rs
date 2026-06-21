@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod fusion;
 mod proxy;
+mod responses;
 mod security;
 mod storage;
 mod web_tools;

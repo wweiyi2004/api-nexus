@@ -18,6 +18,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::{AppConfig, Provider};
 use crate::fusion;
+use crate::responses;
 pub use crate::storage::RequestLogEntry;
 use crate::storage::RequestLogStore;
 
@@ -251,6 +252,7 @@ pub fn create_proxy_router_with_stats(
         ]);
 
     Router::new()
+        .route("/v1/responses", any(responses_handler))
         .route("/v1/chat/completions", any(proxy_handler))
         .route("/v1/completions", any(proxy_handler))
         .route("/v1/embeddings", any(proxy_handler))
@@ -550,7 +552,10 @@ fn bad_gateway(message: impl Into<String>) -> Response {
 }
 
 fn replay_request_body(path: &str, body: &Value) -> Option<String> {
-    if !matches!(path, "/v1/chat/completions" | "/v1/messages") {
+    if !matches!(
+        path,
+        "/v1/chat/completions" | "/v1/messages" | "/v1/responses"
+    ) {
         return None;
     }
     let body_text = body.to_string();
@@ -2034,6 +2039,168 @@ async fn select_providers(
     Ok(providers)
 }
 
+fn responses_error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+    (status, Json(responses::error_body(message, error_type))).into_response()
+}
+
+async fn responses_handler(
+    State(state): State<ProxyState>,
+    method: Method,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    if method == Method::OPTIONS {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if method != Method::POST {
+        return responses_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request_error",
+            "Only POST is supported for this endpoint",
+        );
+    }
+
+    let started = std::time::Instant::now();
+    let config = state.config.read().await;
+    let api_key_name = match authorize_proxy_request(&headers, &config) {
+        Ok(name) => name,
+        Err(_) => {
+            return responses_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid or missing API key",
+            )
+        }
+    };
+    let mut body_json: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return responses_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid JSON: {error}"),
+            )
+        }
+    };
+    let raw_model = body_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let model = resolve_model_alias(&config, raw_model).to_string();
+    let config = config.clone();
+    if model != raw_model {
+        body_json["model"] = Value::String(model.clone());
+    }
+    if !fusion::is_fusion_model(&model) {
+        return responses_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            "The Responses endpoint currently supports only nexus/fusion",
+        );
+    }
+    let parsed = match responses::parse_request(&body_json) {
+        Ok(request) => request,
+        Err(error) => {
+            return responses_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &error,
+            )
+        }
+    };
+    let response_model = parsed.model.clone();
+    let stream = parsed.stream;
+    let client_tools = parsed.client_tools.clone();
+    let request_body = replay_request_body(uri.path(), &body_json);
+    let log_context = RequestLogContext {
+        method: "POST",
+        path: uri.path().to_string(),
+        model: model.clone(),
+        provider: "Fusion".to_string(),
+        provider_id: "nexus-fusion".to_string(),
+        api_key_name,
+        status: 200,
+        started,
+        request_body,
+    };
+
+    match fusion::run_from_responses_request(&state.client, &state.request_logs, &config, parsed)
+        .await
+    {
+        Ok(turn) => {
+            let response_body = match responses::completed_response(
+                &response_model,
+                turn.text.as_deref(),
+                &turn.tool_calls,
+                &client_tools,
+                turn.usage,
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    return responses_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "server_error",
+                        &error,
+                    )
+                }
+            };
+            record_token_usage(&state.token_stats, turn.usage).await;
+            log_request_with_body(&state.request_logs, &log_context, turn.usage, None).await;
+            if stream {
+                match responses::sse_body(&response_body) {
+                    Ok(body) => Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        )
+                        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+                        .body(Body::from(body))
+                        .unwrap_or_else(|error| {
+                            responses_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "server_error",
+                                &format!("Failed to build Responses stream: {error}"),
+                            )
+                        }),
+                    Err(error) => {
+                        responses_error_response(StatusCode::BAD_GATEWAY, "server_error", &error)
+                    }
+                }
+            } else {
+                Json(response_body).into_response()
+            }
+        }
+        Err(error) => {
+            let status = if error.is_bad_request() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            let message = error.to_string();
+            let mut failed_log = log_context;
+            failed_log.status = status.as_u16();
+            log_request_with_body(
+                &state.request_logs,
+                &failed_log,
+                TokenUsage::default(),
+                Some(message.clone()),
+            )
+            .await;
+            responses_error_response(
+                status,
+                if status == StatusCode::BAD_REQUEST {
+                    "invalid_request_error"
+                } else {
+                    "server_error"
+                },
+                &message,
+            )
+        }
+    }
+}
+
 async fn anthropic_handler(
     State(state): State<ProxyState>,
     method: Method,
@@ -3107,6 +3274,398 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["panel", "panel", "judge"]
         );
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_fusion_round_trips_a_codex_function_call() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default();
+                let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| message["role"] == "tool")
+                });
+                let message = if model == "final" && !has_tool_output {
+                    json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_shell_1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell_command",
+                                "arguments": "{\"command\":\"rg --files\"}"
+                            }
+                        }]
+                    })
+                } else if model == "final" {
+                    json!({"role": "assistant", "content": "Repository inspected."})
+                } else {
+                    json!({"role": "assistant", "content": format!("analysis from {model}")})
+                };
+                Json(json!({
+                    "choices": [{"message": message}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+                }))
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let store = Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap());
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(TokenStats::default())),
+            store,
+        );
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+        let client = reqwest::Client::new();
+        let tool = json!({
+            "type": "function",
+            "name": "shell_command",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        });
+
+        let first = client
+            .post(format!("http://{}/v1/responses", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "instructions": "You are a coding agent.",
+                "input": [{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Inspect this repository"}
+                ]}],
+                "tools": [tool.clone()],
+                "tool_choice": "auto",
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body: Value = first.json().await.unwrap();
+        assert_eq!(first_body["object"], "response");
+        assert_eq!(first_body["output"][0]["type"], "function_call");
+        assert_eq!(first_body["output"][0]["call_id"], "call_shell_1");
+
+        let second = client
+            .post(format!("http://{}/v1/responses", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "instructions": "You are a coding agent.",
+                "input": [
+                    {"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "Inspect this repository"}
+                    ]},
+                    first_body["output"][0].clone(),
+                    {"type": "function_call_output", "call_id": "call_shell_1", "output": "README.md"}
+                ],
+                "tools": [tool],
+                "tool_choice": "auto",
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body: Value = second.json().await.unwrap();
+        assert_eq!(second_body["output"][0]["type"], "message");
+        assert_eq!(
+            second_body["output"][0]["content"][0]["text"],
+            "Repository inspected."
+        );
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_fusion_stream_contains_completed_event() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default();
+                Json(json!({
+                    "choices": [{"message": {
+                        "role": "assistant", "content": format!("answer from {model}")
+                    }}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+                }))
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/responses", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "input": "ping",
+                "tools": [],
+                "tool_choice": "auto",
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("event: response.output_item.done\n"));
+        assert!(body.contains("event: response.completed\n"));
+        assert!(body.ends_with("\n\n"));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_on_demand_executes_fusion_server_tool() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    let model = body["model"].as_str().unwrap_or_default();
+                    let has_fusion_result = body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| {
+                            message["role"] == "tool" && message["tool_call_id"] == "call_fusion"
+                        })
+                    });
+                    let message = if model == "outer" && !has_fusion_result {
+                        json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_fusion",
+                                "type": "function",
+                                "function": {"name": "fusion", "arguments": "{}"}
+                            }]
+                        })
+                    } else if model == "outer" {
+                        json!({"role": "assistant", "content": "outer used fusion"})
+                    } else {
+                        json!({"role": "assistant", "content": format!("analysis from {model}")})
+                    };
+                    Json(json!({
+                        "choices": [{"message": message}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                    "outer".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: on_demand_fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/responses", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "input": "analyze carefully",
+                "tools": [{
+                    "type": "function",
+                    "name": "shell_command",
+                    "description": "Run a command",
+                    "parameters": {"type": "object", "properties": {}}
+                }],
+                "tool_choice": "auto",
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["output"][0]["content"][0]["text"], "outer used fusion");
+        let requests = captured_requests.lock().unwrap();
+        let first_outer = requests
+            .iter()
+            .find(|request| request["model"] == "outer")
+            .unwrap();
+        let tool_names = first_outer["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"fusion"));
+        assert!(tool_names.contains(&"shell_command"));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a locally installed Codex CLI"]
+    async fn codex_cli_can_use_fusion_responses_provider() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    let model = body["model"].as_str().unwrap_or_default();
+                    let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| message["role"] == "tool")
+                    });
+                    let message = if model == "final" && !has_tool_output {
+                        json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_codex_e2e",
+                                "type": "function",
+                                "function": {
+                                    "name": "shell_command",
+                                    "arguments": "{\"command\":\"Write-Output CODEX_TOOL_OK\"}"
+                                }
+                            }]
+                        })
+                    } else {
+                        json!({"role": "assistant", "content": "OK"})
+                    };
+                    Json(json!({
+                        "choices": [{"message": message}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            proxy_api_key: "sk-codex-e2e".to_string(),
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+        let provider_config = format!(
+            "model_providers.api_nexus={{name=\"API Nexus\",base_url=\"http://{proxy_addr}/v1\",env_key=\"API_NEXUS_TEST_KEY\",wire_api=\"responses\"}}"
+        );
+
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "codex"]);
+            command
+        } else {
+            tokio::process::Command::new("codex")
+        };
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            command
+                .args([
+                    "exec",
+                    "--ignore-user-config",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-c",
+                    "model=\"nexus/fusion\"",
+                    "-c",
+                    "model_provider=\"api_nexus\"",
+                    "-c",
+                    &provider_config,
+                    "Complete the requested tool step, then reply with exactly OK.",
+                ])
+                .env("API_NEXUS_TEST_KEY", "sk-codex-e2e")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("Codex CLI timed out")
+        .expect("failed to launch Codex CLI");
+
+        assert!(
+            output.status.success(),
+            "Codex failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"type\":\"agent_message\""));
+        assert!(stdout.contains("\"text\":\"OK\""));
+        assert!(stdout.contains("CODEX_TOOL_OK"));
+        let requests = captured_requests.lock().unwrap();
+        assert!(requests.iter().any(|request| {
+            request["model"] == "final"
+                && request["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "tool"
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|content| content.contains("CODEX_TOOL_OK"))
+                    })
+                })
+        }));
+
         upstream_task.abort();
         proxy_task.abort();
     }
