@@ -429,13 +429,37 @@ async fn run_forced_client_turn(
     require_tool: bool,
     overrides: Option<FusionModelOverride>,
 ) -> Result<CompletedResponsesTurn, FusionError> {
+    if is_client_tool_result_followup(&messages) {
+        let resolved =
+            resolve_fusion_models(config, overrides).map_err(FusionError::bad_request)?;
+        let followup_messages = with_system_message(
+            &messages,
+            "Continue the coding-agent tool loop using the returned client tool results. Call another client tool only when needed; otherwise answer the user directly.",
+        );
+        let outcome = run_client_capable_model(
+            client,
+            &resolved.final_model,
+            followup_messages,
+            max_output_tokens,
+            &[],
+            &client_tools,
+            &NO_TOOLS_EXECUTOR,
+            0,
+            require_tool,
+        )
+        .await
+        .map_err(FusionError::upstream)?;
+        return Ok(completed_responses_turn(outcome, TokenUsage::default()));
+    }
+
+    let analysis_messages = messages_for_fusion_analysis(&messages);
     let analysis = run_with_messages(
         client,
         store,
         config,
         input_protocol.to_string(),
         None,
-        messages.clone(),
+        analysis_messages,
         overrides.clone(),
         None,
         false,
@@ -600,10 +624,13 @@ async fn run_on_demand_client_turn(
         ));
     }
     let outer = resolve_model_ref(config, outer_ref).map_err(FusionError::bad_request)?;
-    let outer_messages = with_system_message(
-        &messages,
-        "You are the outer coding model for API Nexus Fusion. Answer the client turn directly or call a client tool. Call the server-side fusion tool when independent panel analysis would materially improve correctness. Never return the fusion tool to the client.",
-    );
+    let client_tool_followup = is_client_tool_result_followup(&messages);
+    let outer_system = if client_tool_followup {
+        "Continue the coding-agent tool loop using the returned client tool results. Call another client tool only when needed; otherwise answer the user directly. Do not restart Fusion analysis for this tool-result turn."
+    } else {
+        "You are the outer coding model for API Nexus Fusion. Answer the client turn directly or call a client tool. Call the server-side fusion tool when independent panel analysis would materially improve correctness. Never return the fusion tool to the client."
+    };
+    let outer_messages = with_system_message(&messages, outer_system);
     let executor = FusionToolExecutor {
         client: client.clone(),
         store: store.clone(),
@@ -613,15 +640,20 @@ async fn run_on_demand_client_turn(
         overrides,
         usage: tokio::sync::Mutex::new(TokenUsage::default()),
     };
+    let server_tools = if client_tool_followup {
+        Vec::new()
+    } else {
+        vec![fusion_tool_spec()]
+    };
     let outcome = run_client_capable_model(
         client,
         &outer,
         outer_messages,
         max_output_tokens,
-        &[fusion_tool_spec()],
+        &server_tools,
         &client_tools,
         &executor,
-        1,
+        if client_tool_followup { 0 } else { 1 },
         require_tool,
     )
     .await
@@ -838,7 +870,7 @@ impl ToolExecutor for FusionToolExecutor {
         if call.name != "fusion" {
             return Err(format!("Unknown server tool: {}", call.name));
         }
-        let mut messages = self.messages.clone();
+        let mut messages = messages_for_fusion_analysis(&self.messages);
         if let Some(focus) = call
             .arguments
             .get("focus")
@@ -1456,6 +1488,69 @@ fn with_system_message(messages: &[Value], system: &str) -> Vec<Value> {
     output
 }
 
+fn is_client_tool_result_followup(messages: &[Value]) -> bool {
+    messages.iter().rev().find_map(
+        |message| match message.get("role").and_then(Value::as_str) {
+            Some("system" | "developer") => None,
+            Some("tool") => Some(true),
+            Some(_) | None => Some(false),
+        },
+    ) == Some(true)
+}
+
+fn messages_for_fusion_analysis(messages: &[Value]) -> Vec<Value> {
+    let mut transcript = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if matches!(role, "system" | "developer") {
+            continue;
+        }
+
+        let text = content_text(message.get("content").unwrap_or(&Value::Null));
+        match role {
+            "assistant" => {
+                let tool_names = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| {
+                        call.get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                    })
+                    .collect::<Vec<_>>();
+                if !text.is_empty() {
+                    transcript.push(format!("assistant: {text}"));
+                }
+                if !tool_names.is_empty() {
+                    transcript.push(format!(
+                        "assistant requested client tools: {}",
+                        tool_names.join(", ")
+                    ));
+                }
+            }
+            "tool" => {
+                let call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                transcript.push(format!("client tool result ({call_id}): {text}"));
+            }
+            _ if !text.is_empty() => transcript.push(format!("user: {text}")),
+            _ => {}
+        }
+    }
+
+    vec![json!({
+        "role": "user",
+        "content": transcript.join("\n\n")
+    })]
+}
+
 fn normalize_protocol(protocol: &str) -> String {
     if protocol.eq_ignore_ascii_case("anthropic") {
         "anthropic".to_string()
@@ -1609,6 +1704,45 @@ mod tests {
         assert_eq!(response["model"], FUSION_MODEL_ID);
         assert_eq!(response["choices"][0]["message"]["content"], "done");
         assert_eq!(response["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn detects_only_pure_client_tool_result_followups() {
+        let tool_followup = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "Read", "arguments": "{}"}
+            }]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "file"}),
+        ];
+        assert!(is_client_tool_result_followup(&tool_followup));
+
+        let mut new_user_turn = tool_followup;
+        new_user_turn.push(json!({"role": "user", "content": "now review it"}));
+        assert!(!is_client_tool_result_followup(&new_user_turn));
+    }
+
+    #[test]
+    fn fusion_analysis_flattens_client_tools_and_omits_client_system_prompts() {
+        let messages = vec![
+            json!({"role": "system", "content": "large coding-agent instructions"}),
+            json!({"role": "user", "content": "inspect the project"}),
+            json!({"role": "assistant", "content": "checking", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "Read", "arguments": "{\"path\":\"README.md\"}"}
+            }]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "API Nexus"}),
+        ];
+
+        let analysis = messages_for_fusion_analysis(&messages);
+        assert_eq!(analysis.len(), 1);
+        assert_eq!(analysis[0]["role"], "user");
+        let content = analysis[0]["content"].as_str().unwrap();
+        assert!(content.contains("inspect the project"));
+        assert!(content.contains("assistant requested client tools: Read"));
+        assert!(content.contains("client tool result (call_1): API Nexus"));
+        assert!(!content.contains("large coding-agent instructions"));
+        assert!(analysis[0].get("tool_calls").is_none());
     }
 
     #[test]

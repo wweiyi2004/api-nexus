@@ -3677,6 +3677,25 @@ mod tests {
                     let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
                         messages.iter().any(|message| message["role"] == "tool")
                     });
+                    let has_structured_tool_history =
+                        body["messages"].as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message["role"] == "tool"
+                                    || message
+                                        .get("tool_calls")
+                                        .and_then(Value::as_array)
+                                        .is_some_and(|calls| !calls.is_empty())
+                            })
+                        });
+                    if model != "final" && has_structured_tool_history {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {
+                                "message": "reasoning_content must be passed back"
+                            }})),
+                        )
+                            .into_response();
+                    }
                     let message = if model == "final" && !has_tool_output {
                         json!({
                             "role": "assistant",
@@ -3697,6 +3716,7 @@ mod tests {
                         "choices": [{"message": message}],
                         "usage": {"prompt_tokens": 2, "completion_tokens": 1}
                     }))
+                    .into_response()
                 }
             }),
         );
@@ -4217,6 +4237,25 @@ mod tests {
                     let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
                         messages.iter().any(|message| message["role"] == "tool")
                     });
+                    let has_structured_tool_history =
+                        body["messages"].as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message["role"] == "tool"
+                                    || message
+                                        .get("tool_calls")
+                                        .and_then(Value::as_array)
+                                        .is_some_and(|calls| !calls.is_empty())
+                            })
+                        });
+                    if model != "final" && has_structured_tool_history {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {
+                                "message": "reasoning_content must be passed back"
+                            }})),
+                        )
+                            .into_response();
+                    }
                     let message = if model == "final" && !has_tool_output {
                         json!({
                             "role": "assistant",
@@ -4239,6 +4278,7 @@ mod tests {
                         "choices": [{"message": message}],
                         "usage": {"prompt_tokens": 2, "completion_tokens": 3}
                     }))
+                    .into_response()
                 }
             }),
         );
@@ -4297,6 +4337,12 @@ mod tests {
         assert!(first_sse.contains("\"stop_reason\":\"tool_use\""));
         assert!(first_sse.contains("\"name\":\"Bash\""));
         assert!(first_sse.contains("CLAUDE_TOOL_OK"));
+        let analysis_calls_after_first = captured_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["model"] != "final")
+            .count();
 
         let second = client
             .post(format!("http://{}/v1/messages?beta=true", proxy_addr))
@@ -4346,6 +4392,14 @@ mod tests {
                     })
                 })
         }));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["model"] != "final")
+                .count(),
+            analysis_calls_after_first,
+            "tool-result turns must not rerun panel/judge models"
+        );
 
         upstream_task.abort();
         proxy_task.abort();
@@ -4389,9 +4443,14 @@ mod tests {
             post(move |Json(body): Json<Value>| {
                 let captured = captured_for_handler.clone();
                 async move {
+                    let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| message["role"] == "tool")
+                    });
                     captured.lock().unwrap().push(body);
-                    Json(json!({
-                        "choices": [{"message": {
+                    let message = if has_tool_output {
+                        json!({"role": "assistant", "content": "Directory inspected."})
+                    } else {
+                        json!({
                             "role": "assistant",
                             "content": null,
                             "tool_calls": [{
@@ -4402,7 +4461,10 @@ mod tests {
                                     "arguments": "{\"command\":\"pwd\"}"
                                 }
                             }]
-                        }}],
+                        })
+                    };
+                    Json(json!({
+                        "choices": [{"message": message}],
                         "usage": {"prompt_tokens": 2, "completion_tokens": 1}
                     }))
                 }
@@ -4449,16 +4511,55 @@ mod tests {
         let sse = response.text().await.unwrap();
         assert!(sse.contains("toolu_outer_bash"));
         assert!(sse.contains("\"name\":\"Bash\""));
-        let requests = captured_requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let tool_names = requests[0]["tools"]
-            .as_array()
+
+        let followup = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&json!({
+                "model": "nexus/fusion",
+                "messages": [
+                    {"role": "user", "content": "Inspect the directory"},
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use", "id": "toolu_outer_bash", "name": "Bash",
+                        "input": {"command": "pwd"}
+                    }]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "toolu_outer_bash",
+                        "content": "C:/project"
+                    }]}
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "max_tokens": 1024,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(followup.status(), StatusCode::OK);
+        assert!(followup
+            .text()
+            .await
             .unwrap()
-            .iter()
-            .map(|tool| tool["function"]["name"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert!(tool_names.contains(&"fusion"));
-        assert!(tool_names.contains(&"Bash"));
+            .contains("Directory inspected."));
+
+        let requests = captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let tool_names = |request: &Value| -> Vec<String> {
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(tool_names(&requests[0]).iter().any(|name| name == "fusion"));
+        assert!(tool_names(&requests[0]).iter().any(|name| name == "Bash"));
+        assert!(!tool_names(&requests[1]).iter().any(|name| name == "fusion"));
+        assert!(tool_names(&requests[1]).iter().any(|name| name == "Bash"));
 
         upstream_task.abort();
         proxy_task.abort();

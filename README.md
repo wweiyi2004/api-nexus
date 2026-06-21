@@ -85,6 +85,8 @@ Fusion 代理提供两种模式：
 
 Responses 和 Anthropic Messages 入口接受流式请求。API Nexus 会先完成内部 Fusion 编排，再发送符合对应协议的 SSE；OpenAI Chat Completions 的 Fusion 入口目前仍为非流式。
 
+在 Codex 或 Claude Code 的 Agent 工具循环中，初始任务会执行完整 Fusion；后续纯 `tool_result` 轮次直接交给 Final（按需模式交给 Outer），不会在每次读取文件或执行命令后重复运行 Panel/Judge。需要重新分析包含工具历史的新用户任务时，API Nexus 会先将工具记录转换为普通文本再交给 Panel，避免不同供应商的推理字段不兼容。
+
 ### 网页工具
 
 Fusion 的 Panel 和 Judge 模型可以通过本地 [open-webSearch](https://www.npmjs.com/package/open-websearch) 服务使用 `web_search` 和 `web_fetch`。需要单独启动该服务：
