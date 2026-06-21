@@ -124,6 +124,91 @@ pub fn parse_anthropic_tool_calls(response: &Value) -> (Option<String>, Vec<Tool
     ((!text.is_empty()).then_some(text), calls)
 }
 
+/// Build an OpenAI chat-completions request with optional function tools.
+pub fn openai_request_body(
+    model: &str,
+    messages: &[Value],
+    max_tokens: u64,
+    tools: &[ToolSpec],
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_openai_tool).collect());
+    }
+    body
+}
+
+/// Build an Anthropic messages request with optional native tools.
+pub fn anthropic_request_body(
+    model: &str,
+    system: Option<&str>,
+    messages: &[Value],
+    max_tokens: u64,
+    tools: &[ToolSpec],
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    if let Some(system) = system.filter(|value| !value.is_empty()) {
+        body["system"] = Value::String(system.to_string());
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.iter().map(ToolSpec::to_anthropic_tool).collect());
+    }
+    body
+}
+
+/// Echo the OpenAI assistant message and append one tool result per call.
+pub fn openai_followup_messages(assistant: &Value, results: &[(ToolCall, String)]) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(results.len() + 1);
+    messages.push(assistant.clone());
+    messages.extend(results.iter().map(|(call, result)| {
+        json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": result,
+        })
+    }));
+    messages
+}
+
+/// Reconstruct an Anthropic assistant tool-use turn and its user tool results.
+pub fn anthropic_followup_messages(results: &[(ToolCall, String)]) -> Vec<Value> {
+    let tool_uses = results
+        .iter()
+        .map(|(call, _)| {
+            json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": call.arguments,
+            })
+        })
+        .collect::<Vec<_>>();
+    let tool_results = results
+        .iter()
+        .map(|(call, result)| {
+            json!({
+                "type": "tool_result",
+                "tool_use_id": call.id,
+                "content": result,
+            })
+        })
+        .collect::<Vec<_>>();
+    vec![
+        json!({"role": "assistant", "content": tool_uses}),
+        json!({"role": "user", "content": tool_results}),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +281,89 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "tu_1");
         assert_eq!(calls[0].arguments, json!({"url":"https://e.com"}));
+    }
+
+    fn fetch_spec() -> ToolSpec {
+        ToolSpec {
+            name: "web_fetch".into(),
+            description: "Fetch a URL".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }),
+        }
+    }
+
+    #[test]
+    fn request_bodies_inject_protocol_specific_tools() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let spec = fetch_spec();
+        let openai = openai_request_body("gpt", &messages, 123, std::slice::from_ref(&spec));
+        assert_eq!(openai["tools"][0]["type"], "function");
+        assert_eq!(openai["tools"][0]["function"]["name"], "web_fetch");
+        assert_eq!(openai["messages"], json!(messages));
+
+        let anthropic = anthropic_request_body(
+            "claude",
+            Some("be useful"),
+            &messages,
+            123,
+            std::slice::from_ref(&spec),
+        );
+        assert_eq!(anthropic["tools"][0]["name"], "web_fetch");
+        assert_eq!(anthropic["system"], "be useful");
+
+        assert!(openai_request_body("gpt", &messages, 123, &[])
+            .get("tools")
+            .is_none());
+        assert!(anthropic_request_body("claude", None, &messages, 123, &[])
+            .get("tools")
+            .is_none());
+    }
+
+    #[test]
+    fn openai_followup_echoes_assistant_and_uses_tool_call_id() {
+        let assistant = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "web_fetch", "arguments": "{\"url\":\"https://e.com\"}"
+            }}]
+        });
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "web_fetch".into(),
+            arguments: json!({"url": "https://e.com"}),
+        };
+        let messages = openai_followup_messages(&assistant, &[(call, "page".into())]);
+        assert_eq!(messages[0], assistant);
+        assert_eq!(
+            messages[1],
+            json!({
+                "role": "tool", "tool_call_id": "call_1", "content": "page"
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_followup_uses_tool_use_id() {
+        let call = ToolCall {
+            id: "tu_1".into(),
+            name: "web_fetch".into(),
+            arguments: json!({"url": "https://e.com"}),
+        };
+        let messages = anthropic_followup_messages(&[(call, "page".into())]);
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(
+            messages[0]["content"][0]["input"],
+            json!({"url": "https://e.com"})
+        );
+        assert_eq!(
+            messages[1]["content"][0],
+            json!({
+                "type": "tool_result", "tool_use_id": "tu_1", "content": "page"
+            })
+        );
     }
 }
