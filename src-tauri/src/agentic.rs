@@ -8,6 +8,9 @@
 
 use serde_json::{json, Value};
 
+use crate::config::Provider;
+use crate::proxy::{self, TokenUsage};
+
 /// A tool definition advertised to a model, serialized per protocol.
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
@@ -209,10 +212,130 @@ pub fn anthropic_followup_messages(results: &[(ToolCall, String)]) -> Vec<Value>
     ]
 }
 
+/// Drive one provider until it returns text without another tool request.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_loop(
+    client: &reqwest::Client,
+    provider: &Provider,
+    model: &str,
+    system: Option<&str>,
+    mut messages: Vec<Value>,
+    max_tokens: u64,
+    tools: &[ToolSpec],
+    executor: &dyn ToolExecutor,
+    max_tool_calls: u32,
+) -> Result<(String, TokenUsage), String> {
+    let anthropic = proxy::is_anthropic_provider(provider);
+    let mut usage = TokenUsage::default();
+    let mut executed_calls = 0_u32;
+    let mut best_text = None;
+
+    loop {
+        let request_body = if anthropic {
+            anthropic_request_body(model, system, &messages, max_tokens, tools)
+        } else {
+            openai_request_body(model, &messages, max_tokens, tools)
+        };
+        let url = if anthropic {
+            proxy::anthropic_upstream_url(&provider.base_url, "/v1/messages")
+        } else {
+            proxy::openai_upstream_url(&provider.base_url, "/v1/chat/completions")
+        };
+        let mut request = client.post(url).header("content-type", "application/json");
+        request = if anthropic {
+            request
+                .header("x-api-key", &provider.api_key)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            request.header("authorization", format!("Bearer {}", provider.api_key))
+        };
+        let response = request
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let response_text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("HTTP {} - {}", status.as_u16(), response_text));
+        }
+        let response_body: Value = serde_json::from_str(&response_text).map_err(|error| {
+            let protocol = if anthropic { "Anthropic" } else { "OpenAI" };
+            format!("Failed to parse {protocol} response: {error}")
+        })?;
+        add_usage(&mut usage, proxy::extract_token_usage(&response_body));
+
+        let (text, calls) = if anthropic {
+            parse_anthropic_tool_calls(&response_body)
+        } else {
+            parse_openai_tool_calls(&response_body)
+        };
+        if text.is_some() {
+            best_text = text;
+        }
+        if calls.is_empty() {
+            return best_text
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| (content, usage))
+                .ok_or_else(|| "empty model response".to_string());
+        }
+
+        let call_count = u32::try_from(calls.len()).unwrap_or(u32::MAX);
+        if tools.is_empty()
+            || executed_calls.saturating_add(call_count) > max_tool_calls
+            || max_tool_calls == 0
+        {
+            return best_text
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| (content, usage))
+                .ok_or_else(|| "exceeded max_tool_calls".to_string());
+        }
+
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let result = executor
+                .execute(&call)
+                .await
+                .unwrap_or_else(|error| format!("Tool error: {error}"));
+            results.push((call, result));
+        }
+        executed_calls = executed_calls.saturating_add(call_count);
+
+        if anthropic {
+            messages.extend(anthropic_followup_messages(&results));
+        } else {
+            let assistant = response_body
+                .get("choices")
+                .and_then(|choices| choices.get(0))
+                .and_then(|choice| choice.get("message"))
+                .cloned()
+                .ok_or_else(|| "OpenAI tool response is missing assistant message".to_string())?;
+            messages.extend(openai_followup_messages(&assistant, &results));
+        }
+    }
+}
+
+fn add_usage(total: &mut TokenUsage, round: TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(round.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(round.output_tokens);
+    total.cached_tokens = total.cached_tokens.saturating_add(round.cached_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(round.cache_read_tokens);
+    total.cache_write_tokens = total
+        .cache_write_tokens
+        .saturating_add(round.cache_write_tokens);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, routing::post, Json, Router};
     use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     #[test]
     fn tool_spec_serializes_to_openai_function_tool() {
@@ -365,5 +488,212 @@ mod tests {
                 "type": "tool_result", "tool_use_id": "tu_1", "content": "page"
             })
         );
+    }
+
+    #[derive(Clone)]
+    struct ModelServerState {
+        responses: Arc<Vec<Value>>,
+        request_index: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn model_response(
+        State(state): State<ModelServerState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        state.requests.lock().unwrap().push(request);
+        let index = state.request_index.fetch_add(1, Ordering::SeqCst);
+        Json(
+            state
+                .responses
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| json!({"error": "unexpected request"})),
+        )
+    }
+
+    async fn spawn_model_server(responses: Vec<Value>) -> (String, ModelServerState) {
+        let state = ModelServerState {
+            responses: Arc::new(responses),
+            request_index: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(model_response))
+            .route("/v1/messages", post(model_response))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), state)
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: Mutex<Vec<ToolCall>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RecordingExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<String, String> {
+            self.calls.lock().unwrap().push(call.clone());
+            Ok("fetched page".into())
+        }
+    }
+
+    fn provider(base_url: String, protocol: &str) -> Provider {
+        Provider {
+            id: "test".into(),
+            name: "test".into(),
+            protocol: protocol.into(),
+            base_url,
+            api_key: "secret".into(),
+            models: vec!["model".into()],
+            enabled: true,
+            priority: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_returns_plain_completion_and_usage() {
+        let (base_url, state) = spawn_model_server(vec![json!({
+            "choices": [{"message": {"role": "assistant", "content": "answer"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        })])
+        .await;
+        let executor = RecordingExecutor::default();
+        let result = run_tool_loop(
+            &reqwest::Client::new(),
+            &provider(base_url, "openai"),
+            "model",
+            None,
+            vec![json!({"role": "user", "content": "question"})],
+            100,
+            &[],
+            &executor,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.0, "answer");
+        assert_eq!(result.1.input_tokens, 2);
+        assert_eq!(result.1.output_tokens, 3);
+        assert_eq!(state.request_index.load(Ordering::SeqCst), 1);
+        assert!(executor.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_executes_openai_call_and_appends_result() {
+        let (base_url, state) = spawn_model_server(vec![
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": null,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                        "name": "web_fetch", "arguments": "{\"url\":\"https://e.com\"}"
+                    }}]
+                }}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+            }),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "final answer"}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 3}
+            }),
+        ])
+        .await;
+        let executor = RecordingExecutor::default();
+        let result = run_tool_loop(
+            &reqwest::Client::new(),
+            &provider(base_url, "openai"),
+            "model",
+            None,
+            vec![json!({"role": "user", "content": "question"})],
+            100,
+            &[fetch_spec()],
+            &executor,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.0, "final answer");
+        assert_eq!(result.1.input_tokens, 6);
+        assert_eq!(result.1.output_tokens, 4);
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({"url": "https://e.com"}));
+        drop(calls);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(requests[1]["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(requests[1]["messages"][2]["content"], "fetched page");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_executes_anthropic_call_and_appends_result() {
+        let (base_url, state) = spawn_model_server(vec![
+            json!({
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "web_fetch",
+                    "input": {"url": "https://e.com"}}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            }),
+            json!({
+                "content": [{"type": "text", "text": "anthropic answer"}],
+                "usage": {"input_tokens": 4, "output_tokens": 3}
+            }),
+        ])
+        .await;
+        let executor = RecordingExecutor::default();
+        let result = run_tool_loop(
+            &reqwest::Client::new(),
+            &provider(base_url, "anthropic"),
+            "model",
+            Some("system prompt"),
+            vec![json!({"role": "user", "content": "question"})],
+            100,
+            &[fetch_spec()],
+            &executor,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.0, "anthropic answer");
+        assert_eq!(result.1.input_tokens, 6);
+        assert_eq!(result.1.output_tokens, 4);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests[0]["system"], "system prompt");
+        assert_eq!(requests[0]["tools"][0]["name"], "web_fetch");
+        assert_eq!(requests[1]["messages"][1]["content"][0]["id"], "tu_1");
+        assert_eq!(
+            requests[1]["messages"][2]["content"][0]["tool_use_id"],
+            "tu_1"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_loop_with_no_tools_never_invokes_executor() {
+        let (base_url, _) = spawn_model_server(vec![json!({
+            "choices": [{"message": {"role": "assistant", "content": "direct"}}]
+        })])
+        .await;
+        let executor = RecordingExecutor::default();
+        let result = run_tool_loop(
+            &reqwest::Client::new(),
+            &provider(base_url, "openai"),
+            "model",
+            None,
+            vec![],
+            100,
+            &[],
+            &executor,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, "direct");
+        assert!(executor.calls.lock().unwrap().is_empty());
     }
 }
