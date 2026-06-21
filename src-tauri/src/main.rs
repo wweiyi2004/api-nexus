@@ -7,6 +7,7 @@ mod fusion;
 mod proxy;
 mod security;
 mod storage;
+mod web_tools;
 
 use commands::AppState;
 use reqwest::Client;
