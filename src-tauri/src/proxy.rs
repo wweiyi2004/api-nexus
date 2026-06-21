@@ -90,36 +90,28 @@ pub async fn push_request_log(state: &RequestLogState, entry: RequestLogEntry) {
 #[allow(clippy::too_many_arguments)]
 async fn log_request_with_body(
     logs: &RequestLogState,
-    method: &str,
-    path: &str,
-    model: &str,
-    provider: &str,
-    provider_id: &str,
-    api_key_name: &str,
-    status: u16,
+    ctx: &RequestLogContext,
     usage: TokenUsage,
-    started: std::time::Instant,
     error: Option<String>,
-    request_body: Option<String>,
 ) {
     let entry = RequestLogEntry {
         id: 0,
         timestamp: chrono::Utc::now().timestamp(),
-        method: method.to_string(),
-        path: path.to_string(),
-        model: model.to_string(),
-        provider: provider.to_string(),
-        provider_id: provider_id.to_string(),
-        api_key_name: api_key_name.to_string(),
-        status,
+        method: ctx.method.to_string(),
+        path: ctx.path.clone(),
+        model: ctx.model.clone(),
+        provider: ctx.provider.clone(),
+        provider_id: ctx.provider_id.clone(),
+        api_key_name: ctx.api_key_name.clone(),
+        status: ctx.status,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_tokens: usage.cached_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
-        duration_ms: started.elapsed().as_millis() as u64,
+        duration_ms: ctx.started.elapsed().as_millis() as u64,
         error,
-        request_body,
+        request_body: ctx.request_body.clone(),
     };
     push_request_log(logs, entry).await;
 }
@@ -136,6 +128,78 @@ struct RequestLogContext {
     started: std::time::Instant,
     request_body: Option<String>,
 }
+
+/// Which upstream API surface a proxy handler speaks. Used to render
+/// client-visible error bodies in the dialect the caller expects, so the
+/// OpenAI and Anthropic handlers can share their flow.
+#[derive(Clone, Copy)]
+enum ApiDialect {
+    OpenAI,
+    Anthropic,
+}
+
+/// Semantic class of a proxy error, mapped to each dialect's concrete `type`
+/// string by [`ApiDialect::error_type`]. Centralizes the OpenAI/Anthropic
+/// differences that used to be duplicated across both handlers.
+#[derive(Clone, Copy)]
+enum ErrorKind {
+    /// 400/405 — invalid request. Both dialects use `invalid_request_error`.
+    BadRequest,
+    /// 404 — no matching provider. OpenAI keeps `invalid_request_error`,
+    /// Anthropic uses `not_found_error`.
+    NotFound,
+    /// 5xx — upstream/server failure. OpenAI uses `server_error`, Anthropic
+    /// uses `api_error`.
+    Upstream,
+}
+
+impl ApiDialect {
+    fn error_type(self, kind: ErrorKind) -> &'static str {
+        match (self, kind) {
+            (_, ErrorKind::BadRequest) => "invalid_request_error",
+            (ApiDialect::OpenAI, ErrorKind::NotFound) => "invalid_request_error",
+            (ApiDialect::Anthropic, ErrorKind::NotFound) => "not_found_error",
+            (ApiDialect::OpenAI, ErrorKind::Upstream) => "server_error",
+            (ApiDialect::Anthropic, ErrorKind::Upstream) => "api_error",
+        }
+    }
+
+    /// Build the JSON error body in this dialect's shape. OpenAI nests under
+    /// `error.{message,type}`; Anthropic wraps that in a top-level
+    /// `{"type":"error", ...}` envelope. The one shape NOT produced here is
+    /// OpenAI's invalid-JSON body, which is a flat `{"error": "<msg>"}` string
+    /// and stays inlined at its call site.
+    fn error_body(self, kind: ErrorKind, message: &str, details: Option<&[String]>) -> Value {
+        let error_type = self.error_type(kind);
+        match self {
+            ApiDialect::OpenAI => {
+                let mut error = json!({ "message": message, "type": error_type });
+                if let Some(details) = details {
+                    error["details"] = json!(details);
+                }
+                json!({ "error": error })
+            }
+            ApiDialect::Anthropic => {
+                let mut error = json!({ "type": error_type, "message": message });
+                if let Some(details) = details {
+                    error["details"] = json!(details);
+                }
+                json!({ "type": "error", "error": error })
+            }
+        }
+    }
+
+    fn error_response(
+        self,
+        status: StatusCode,
+        kind: ErrorKind,
+        message: &str,
+        details: Option<&[String]>,
+    ) -> Response {
+        (status, Json(self.error_body(kind, message, details))).into_response()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<RwLock<AppConfig>>,
@@ -629,53 +693,17 @@ async fn passthrough_response(
                 usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
             }
             record_token_usage(&token_stats, usage).await;
-            log_request_with_body(
-                &request_logs,
-                log_context.method,
-                &log_context.path,
-                &log_context.model,
-                &log_context.provider,
-                &log_context.provider_id,
-                &log_context.api_key_name,
-                log_context.status,
-                usage,
-                log_context.started,
-                None,
-                log_context.request_body.clone(),
-            )
-            .await;
+            log_request_with_body(&request_logs, &log_context, usage, None).await;
         } else if let Ok(body_json) = serde_json::from_slice::<Value>(&accumulated) {
             let usage = extract_token_usage(&body_json);
             record_token_usage(&token_stats, usage).await;
-            log_request_with_body(
-                &request_logs,
-                log_context.method,
-                &log_context.path,
-                &log_context.model,
-                &log_context.provider,
-                &log_context.provider_id,
-                &log_context.api_key_name,
-                log_context.status,
-                usage,
-                log_context.started,
-                None,
-                log_context.request_body.clone(),
-            )
-            .await;
+            log_request_with_body(&request_logs, &log_context, usage, None).await;
         } else {
             log_request_with_body(
                 &request_logs,
-                log_context.method,
-                &log_context.path,
-                &log_context.model,
-                &log_context.provider,
-                &log_context.provider_id,
-                &log_context.api_key_name,
-                log_context.status,
+                &log_context,
                 TokenUsage::default(),
-                log_context.started,
                 Some("Failed to parse response usage".to_string()),
-                log_context.request_body.clone(),
             )
             .await;
         }
@@ -1584,21 +1612,7 @@ async fn openai_stream_to_anthropic_response(
         }))));
 
         record_token_usage(&token_stats, usage).await;
-        log_request_with_body(
-            &request_logs,
-            log_context.method,
-            &log_context.path,
-            &log_context.model,
-            &log_context.provider,
-            &log_context.provider_id,
-            &log_context.api_key_name,
-            log_context.status,
-            usage,
-            log_context.started,
-            None,
-            log_context.request_body.clone(),
-        )
-        .await;
+        log_request_with_body(&request_logs, &log_context, usage, None).await;
     };
 
     Response::builder()
@@ -1729,21 +1743,7 @@ async fn anthropic_stream_to_openai_response(
         }
 
         record_token_usage(&token_stats, usage).await;
-        log_request_with_body(
-            &request_logs,
-            log_context.method,
-            &log_context.path,
-            &log_context.model,
-            &log_context.provider,
-            &log_context.provider_id,
-            &log_context.api_key_name,
-            log_context.status,
-            usage,
-            log_context.started,
-            None,
-            log_context.request_body.clone(),
-        )
-        .await;
+        log_request_with_body(&request_logs, &log_context, usage, None).await;
     };
 
     Response::builder()
@@ -1757,6 +1757,262 @@ async fn anthropic_stream_to_openai_response(
         .unwrap_or_else(|err| bad_gateway(format!("Failed to build stream response: {}", err)))
 }
 
+/// Everything a proxy handler needs after the shared preamble: auth identity,
+/// parsed body, resolved model, stream flag, and the loggable request snapshot.
+struct Prepared {
+    api_key_name: String,
+    body_json: Value,
+    model: String,
+    is_stream: bool,
+    request_body_for_log: Option<String>,
+    request_path: String,
+    started: std::time::Instant,
+}
+
+/// Shared preamble for both proxy handlers: reject non-POST, authorize, parse
+/// the JSON body, resolve the model alias, and capture stream/log metadata.
+/// On any failure it returns the early `Response` already rendered in the
+/// caller's `dialect` (the OPTIONS preflight is surfaced the same way).
+async fn prepare_request(
+    state: &ProxyState,
+    dialect: ApiDialect,
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    body: &axum::body::Bytes,
+) -> Result<Prepared, Response> {
+    if *method == Method::OPTIONS {
+        return Err(StatusCode::NO_CONTENT.into_response());
+    }
+    if *method != Method::POST {
+        return Err(dialect.error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            ErrorKind::BadRequest,
+            "Only POST is supported for this endpoint",
+            None,
+        ));
+    }
+
+    let request_path = uri.path().to_string();
+    let started = std::time::Instant::now();
+
+    let config = state.config.read().await;
+    let api_key_name = match authorize_proxy_request(headers, &config) {
+        Ok(name) => name,
+        Err(response) => return Err(*response),
+    };
+
+    let mut body_json: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(e) => {
+            // OpenAI uses a flat `{"error": "<msg>"}` string here; Anthropic
+            // uses the standard nested envelope.
+            let response = match dialect {
+                ApiDialect::OpenAI => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("Invalid JSON: {}", e) })),
+                )
+                    .into_response(),
+                ApiDialect::Anthropic => dialect.error_response(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadRequest,
+                    &format!("Invalid JSON: {}", e),
+                    None,
+                ),
+            };
+            return Err(response);
+        }
+    };
+
+    let raw_model = body_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model = resolve_model_alias(&config, &raw_model).to_string();
+    drop(config);
+
+    if model != raw_model {
+        body_json["model"] = Value::String(model.clone());
+    }
+
+    let is_stream = body_json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let request_body_for_log = replay_request_body(&request_path, &body_json);
+
+    Ok(Prepared {
+        api_key_name,
+        body_json,
+        model,
+        is_stream,
+        request_body_for_log,
+        request_path,
+        started,
+    })
+}
+
+/// If `prepared.model` is a fusion model, run the fusion pipeline for this
+/// dialect and return its (already-logged) response. Returns `None` when the
+/// model is not a fusion model, leaving normal provider routing to the caller.
+async fn try_fusion(state: &ProxyState, dialect: ApiDialect, prepared: &Prepared) -> Option<Response> {
+    if !fusion::is_fusion_model(&prepared.model) {
+        return None;
+    }
+
+    let expected_path = match dialect {
+        ApiDialect::OpenAI => "/v1/chat/completions",
+        ApiDialect::Anthropic => "/v1/messages",
+    };
+
+    let fusion_log = |status: u16| RequestLogContext {
+        method: "POST",
+        path: prepared.request_path.clone(),
+        model: prepared.model.clone(),
+        provider: "Fusion".to_string(),
+        provider_id: "nexus-fusion".to_string(),
+        api_key_name: prepared.api_key_name.clone(),
+        status,
+        started: prepared.started,
+        request_body: prepared.request_body_for_log.clone(),
+    };
+
+    if prepared.request_path != expected_path {
+        let message = format!("Fusion is only supported on {}", expected_path);
+        log_request_with_body(
+            &state.request_logs,
+            &fusion_log(400),
+            TokenUsage::default(),
+            Some(message.clone()),
+        )
+        .await;
+        return Some(dialect.error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadRequest,
+            &message,
+            None,
+        ));
+    }
+
+    let config = state.config.read().await.clone();
+    let run_result = match dialect {
+        ApiDialect::OpenAI => {
+            fusion::run_from_openai_request(
+                &state.client,
+                &state.request_logs,
+                &config,
+                &prepared.body_json,
+                None,
+            )
+            .await
+        }
+        ApiDialect::Anthropic => {
+            fusion::run_from_anthropic_request(
+                &state.client,
+                &state.request_logs,
+                &config,
+                &prepared.body_json,
+                None,
+            )
+            .await
+        }
+    };
+
+    match run_result {
+        Ok(run) => {
+            record_token_usage(&state.token_stats, run.usage).await;
+            log_request_with_body(&state.request_logs, &fusion_log(200), run.usage, None).await;
+            let body = match dialect {
+                ApiDialect::OpenAI => fusion::openai_chat_response(&run.final_content, run.usage),
+                ApiDialect::Anthropic => {
+                    fusion::anthropic_message_response(&run.final_content, run.usage)
+                }
+            };
+            Some(Json(body).into_response())
+        }
+        Err(error) => {
+            let status = if error.is_bad_request() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            let message = error.to_string();
+            log_request_with_body(
+                &state.request_logs,
+                &fusion_log(status.as_u16()),
+                TokenUsage::default(),
+                Some(message.clone()),
+            )
+            .await;
+            let kind = if status == StatusCode::BAD_REQUEST {
+                ErrorKind::BadRequest
+            } else {
+                ErrorKind::Upstream
+            };
+            Some(dialect.error_response(status, kind, &message, None))
+        }
+    }
+}
+
+/// Pick and order the providers eligible for this request, or return the
+/// dialect's "no provider" 404 (already logged) when none match.
+async fn select_providers(
+    state: &ProxyState,
+    dialect: ApiDialect,
+    prepared: &Prepared,
+) -> Result<Vec<Provider>, Response> {
+    let config = state.config.read().await;
+    let mut providers: Vec<Provider> = config
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider_matches_model(provider, &prepared.model)
+                && match dialect {
+                    // An OpenAI-entry request only routes to an Anthropic
+                    // provider on the chat-completions path.
+                    ApiDialect::OpenAI => {
+                        !is_anthropic_provider(provider)
+                            || prepared.request_path == "/v1/chat/completions"
+                    }
+                    ApiDialect::Anthropic => true,
+                }
+        })
+        .cloned()
+        .collect();
+    sort_providers_for_model(&config, &prepared.model, &mut providers);
+    drop(config);
+
+    if providers.is_empty() {
+        let message = format!("No provider found for model: {}", prepared.model);
+        log_request_with_body(
+            &state.request_logs,
+            &RequestLogContext {
+                method: "POST",
+                path: prepared.request_path.clone(),
+                model: prepared.model.clone(),
+                provider: String::new(),
+                provider_id: String::new(),
+                api_key_name: prepared.api_key_name.clone(),
+                status: 404,
+                started: prepared.started,
+                request_body: prepared.request_body_for_log.clone(),
+            },
+            TokenUsage::default(),
+            Some(message.clone()),
+        )
+        .await;
+        return Err(dialect.error_response(
+            StatusCode::NOT_FOUND,
+            ErrorKind::NotFound,
+            &message,
+            None,
+        ));
+    }
+
+    Ok(providers)
+}
+
 async fn anthropic_handler(
     State(state): State<ProxyState>,
     method: Method,
@@ -1764,202 +2020,30 @@ async fn anthropic_handler(
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Response {
-    if method == Method::OPTIONS {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    if method != Method::POST {
-        return (
-            StatusCode::METHOD_NOT_ALLOWED,
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "Only POST is supported for this endpoint"
-                }
-            })),
-        )
-            .into_response();
-    }
-
-    let request_path = uri.path().to_string();
-    let started = std::time::Instant::now();
-
-    let config = state.config.read().await;
-    let api_key_name = match authorize_proxy_request(&headers, &config) {
-        Ok(name) => name,
-        Err(response) => return *response,
+    let dialect = ApiDialect::Anthropic;
+    let prepared = match prepare_request(&state, dialect, &method, &headers, &uri, &body).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
     };
 
-    let mut body_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": format!("Invalid JSON: {}", e)
-                    }
-                })),
-            )
-                .into_response();
-        }
+    if let Some(response) = try_fusion(&state, dialect, &prepared).await {
+        return response;
+    }
+
+    let providers = match select_providers(&state, dialect, &prepared).await {
+        Ok(providers) => providers,
+        Err(response) => return response,
     };
 
-    let raw_model = body_json.get("model").and_then(Value::as_str).unwrap_or("");
-    let resolved_model = resolve_model_alias(&config, raw_model).to_string();
-    drop(config);
-
-    let model = resolved_model.clone();
-    if model != raw_model {
-        body_json["model"] = Value::String(model.clone());
-    }
-    let is_stream = body_json
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let request_body_for_log = replay_request_body(&request_path, &body_json);
-
-    if fusion::is_fusion_model(&model) {
-        if request_path != "/v1/messages" {
-            let message = "Fusion is only supported on /v1/messages".to_string();
-            log_request_with_body(
-                &state.request_logs,
-                "POST",
-                &request_path,
-                &model,
-                "Fusion",
-                "nexus-fusion",
-                &api_key_name,
-                400,
-                TokenUsage::default(),
-                started,
-                Some(message.clone()),
-                request_body_for_log.clone(),
-            )
-            .await;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": message
-                    }
-                })),
-            )
-                .into_response();
-        }
-
-        let config = state.config.read().await.clone();
-        match fusion::run_from_anthropic_request(
-            &state.client,
-            &state.request_logs,
-            &config,
-            &body_json,
-            None,
-        )
-        .await
-        {
-            Ok(run) => {
-                record_token_usage(&state.token_stats, run.usage).await;
-                log_request_with_body(
-                    &state.request_logs,
-                    "POST",
-                    &request_path,
-                    &model,
-                    "Fusion",
-                    "nexus-fusion",
-                    &api_key_name,
-                    200,
-                    run.usage,
-                    started,
-                    None,
-                    request_body_for_log,
-                )
-                .await;
-                return Json(fusion::anthropic_message_response(
-                    &run.final_content,
-                    run.usage,
-                ))
-                .into_response();
-            }
-            Err(error) => {
-                let status = if error.is_bad_request() {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                let message = error.to_string();
-                log_request_with_body(
-                    &state.request_logs,
-                    "POST",
-                    &request_path,
-                    &model,
-                    "Fusion",
-                    "nexus-fusion",
-                    &api_key_name,
-                    status.as_u16(),
-                    TokenUsage::default(),
-                    started,
-                    Some(message.clone()),
-                    request_body_for_log,
-                )
-                .await;
-                return (
-                    status,
-                    Json(json!({
-                        "type": "error",
-                        "error": {
-                            "type": if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { "api_error" },
-                            "message": message
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    let config = state.config.read().await;
-    let mut providers: Vec<_> = config
-        .providers
-        .iter()
-        .filter(|provider| provider_matches_model(provider, &model))
-        .cloned()
-        .collect();
-    sort_providers_for_model(&config, &model, &mut providers);
-    drop(config);
-
-    if providers.is_empty() {
-        log_request_with_body(
-            &state.request_logs,
-            "POST",
-            &request_path,
-            &model,
-            "",
-            "",
-            &api_key_name,
-            404,
-            TokenUsage::default(),
-            started,
-            Some(format!("No provider found for model: {}", model)),
-            request_body_for_log.clone(),
-        )
-        .await;
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "type": "not_found_error",
-                    "message": format!("No provider found for model: {}", model)
-                }
-            })),
-        )
-            .into_response();
-    }
+    let Prepared {
+        api_key_name,
+        body_json,
+        model,
+        is_stream,
+        request_body_for_log,
+        request_path,
+        started,
+    } = prepared;
 
     let mut errors = Vec::new();
 
@@ -2007,17 +2091,19 @@ async fn anthropic_handler(
         if request_path == "/v1/messages/count_tokens" {
             log_request_with_body(
                 &state.request_logs,
-                "POST",
-                &request_path,
-                &model,
-                &provider.name,
-                &provider.id,
-                &api_key_name,
-                200,
+                &RequestLogContext {
+                    method: "POST",
+                    path: request_path.clone(),
+                    model: model.clone(),
+                    provider: provider.name.clone(),
+                    provider_id: provider.id.clone(),
+                    api_key_name: api_key_name.clone(),
+                    status: 200,
+                    started,
+                    request_body: request_body_for_log.clone(),
+                },
                 TokenUsage::default(),
-                started,
                 None,
-                request_body_for_log.clone(),
             )
             .await;
             return Json(json!({
@@ -2087,17 +2173,19 @@ async fn anthropic_handler(
                         record_token_usage(&state.token_stats, usage).await;
                         log_request_with_body(
                             &state.request_logs,
-                            "POST",
-                            &request_path,
-                            &model,
-                            &provider.name,
-                            &provider.id,
-                            &api_key_name,
-                            200,
+                            &RequestLogContext {
+                                method: "POST",
+                                path: request_path.clone(),
+                                model: model.clone(),
+                                provider: provider.name.clone(),
+                                provider_id: provider.id.clone(),
+                                api_key_name: api_key_name.clone(),
+                                status: 200,
+                                started,
+                                request_body: request_body_for_log.clone(),
+                            },
                             usage,
-                            started,
                             None,
-                            request_body_for_log.clone(),
                         )
                         .await;
                         return Json(openai_to_anthropic_response(openai_response, &model))
@@ -2121,32 +2209,28 @@ async fn anthropic_handler(
 
     log_request_with_body(
         &state.request_logs,
-        "POST",
-        &request_path,
-        &model,
-        "",
-        "",
-        &api_key_name,
-        502,
+        &RequestLogContext {
+            method: "POST",
+            path: request_path.clone(),
+            model: model.clone(),
+            provider: String::new(),
+            provider_id: String::new(),
+            api_key_name: api_key_name.clone(),
+            status: 502,
+            started,
+            request_body: request_body_for_log.clone(),
+        },
         TokenUsage::default(),
-        started,
         Some(errors.join("; ")),
-        request_body_for_log,
     )
     .await;
 
-    (
+    dialect.error_response(
         StatusCode::BAD_GATEWAY,
-        Json(json!({
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": "All providers failed",
-                "details": errors
-            }
-        })),
+        ErrorKind::Upstream,
+        "All providers failed",
+        Some(&errors),
     )
-        .into_response()
 }
 
 async fn proxy_handler(
@@ -2156,197 +2240,30 @@ async fn proxy_handler(
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Response {
-    if method == Method::OPTIONS {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    if method != Method::POST {
-        return (
-            StatusCode::METHOD_NOT_ALLOWED,
-            Json(json!({
-                "error": {
-                    "message": "Only POST is supported for this endpoint",
-                    "type": "invalid_request_error"
-                }
-            })),
-        )
-            .into_response();
-    }
-
-    let request_path = uri.path().to_string();
-    let started = std::time::Instant::now();
-
-    let config = state.config.read().await;
-    let api_key_name = match authorize_proxy_request(&headers, &config) {
-        Ok(name) => name,
-        Err(response) => return *response,
+    let dialect = ApiDialect::OpenAI;
+    let prepared = match prepare_request(&state, dialect, &method, &headers, &uri, &body).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
     };
 
-    let mut body_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid JSON: {}", e)})),
-            )
-                .into_response();
-        }
+    if let Some(response) = try_fusion(&state, dialect, &prepared).await {
+        return response;
+    }
+
+    let providers = match select_providers(&state, dialect, &prepared).await {
+        Ok(providers) => providers,
+        Err(response) => return response,
     };
 
-    let raw_model = body_json
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
-    let resolved_model = resolve_model_alias(&config, &raw_model).to_string();
-    drop(config);
-
-    let model = resolved_model.clone();
-    if model != raw_model {
-        body_json["model"] = Value::String(model.clone());
-    }
-
-    let is_stream = body_json
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-    let request_body_for_log = replay_request_body(&request_path, &body_json);
-
-    if fusion::is_fusion_model(&model) {
-        if request_path != "/v1/chat/completions" {
-            let message = "Fusion is only supported on /v1/chat/completions".to_string();
-            log_request_with_body(
-                &state.request_logs,
-                "POST",
-                &request_path,
-                &model,
-                "Fusion",
-                "nexus-fusion",
-                &api_key_name,
-                400,
-                TokenUsage::default(),
-                started,
-                Some(message.clone()),
-                request_body_for_log.clone(),
-            )
-            .await;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": message,
-                        "type": "invalid_request_error"
-                    }
-                })),
-            )
-                .into_response();
-        }
-
-        let config = state.config.read().await.clone();
-        match fusion::run_from_openai_request(
-            &state.client,
-            &state.request_logs,
-            &config,
-            &body_json,
-            None,
-        )
-        .await
-        {
-            Ok(run) => {
-                record_token_usage(&state.token_stats, run.usage).await;
-                log_request_with_body(
-                    &state.request_logs,
-                    "POST",
-                    &request_path,
-                    &model,
-                    "Fusion",
-                    "nexus-fusion",
-                    &api_key_name,
-                    200,
-                    run.usage,
-                    started,
-                    None,
-                    request_body_for_log,
-                )
-                .await;
-                return Json(fusion::openai_chat_response(&run.final_content, run.usage))
-                    .into_response();
-            }
-            Err(error) => {
-                let status = if error.is_bad_request() {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                let message = error.to_string();
-                log_request_with_body(
-                    &state.request_logs,
-                    "POST",
-                    &request_path,
-                    &model,
-                    "Fusion",
-                    "nexus-fusion",
-                    &api_key_name,
-                    status.as_u16(),
-                    TokenUsage::default(),
-                    started,
-                    Some(message.clone()),
-                    request_body_for_log,
-                )
-                .await;
-                return (
-                    status,
-                    Json(json!({
-                        "error": {
-                            "message": message,
-                            "type": if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { "server_error" }
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    let config = state.config.read().await;
-    let mut providers: Vec<_> = config
-        .providers
-        .iter()
-        .filter(|provider| {
-            provider_matches_model(provider, &model)
-                && (!is_anthropic_provider(provider) || request_path == "/v1/chat/completions")
-        })
-        .cloned()
-        .collect();
-    sort_providers_for_model(&config, &model, &mut providers);
-    drop(config);
-
-    if providers.is_empty() {
-        log_request_with_body(
-            &state.request_logs,
-            "POST",
-            &request_path,
-            &model,
-            "",
-            "",
-            &api_key_name,
-            404,
-            TokenUsage::default(),
-            started,
-            Some(format!("No provider found for model: {}", model)),
-            request_body_for_log.clone(),
-        )
-        .await;
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("No provider found for model: {}", model),
-                    "type": "invalid_request_error"
-                }
-            })),
-        )
-            .into_response();
-    }
+    let Prepared {
+        api_key_name,
+        body_json,
+        model,
+        is_stream,
+        request_body_for_log,
+        request_path,
+        started,
+    } = prepared;
 
     let mut errors = Vec::new();
 
@@ -2399,17 +2316,19 @@ async fn proxy_handler(
                             record_token_usage(&state.token_stats, usage).await;
                             log_request_with_body(
                                 &state.request_logs,
-                                "POST",
-                                &request_path,
-                                &model,
-                                &provider.name,
-                                &provider.id,
-                                &api_key_name,
-                                200,
+                                &RequestLogContext {
+                                    method: "POST",
+                                    path: request_path.clone(),
+                                    model: model.clone(),
+                                    provider: provider.name.clone(),
+                                    provider_id: provider.id.clone(),
+                                    api_key_name: api_key_name.clone(),
+                                    status: 200,
+                                    started,
+                                    request_body: request_body_for_log.clone(),
+                                },
                                 usage,
-                                started,
                                 None,
-                                request_body_for_log.clone(),
                             )
                             .await;
                             return Json(anthropic_to_openai_response(anthropic_response, &model))
@@ -2481,31 +2400,28 @@ async fn proxy_handler(
 
     log_request_with_body(
         &state.request_logs,
-        "POST",
-        &request_path,
-        &model,
-        "",
-        "",
-        &api_key_name,
-        502,
+        &RequestLogContext {
+            method: "POST",
+            path: request_path.clone(),
+            model: model.clone(),
+            provider: String::new(),
+            provider_id: String::new(),
+            api_key_name: api_key_name.clone(),
+            status: 502,
+            started,
+            request_body: request_body_for_log.clone(),
+        },
         TokenUsage::default(),
-        started,
         Some(errors.join("; ")),
-        request_body_for_log,
     )
     .await;
 
-    (
+    dialect.error_response(
         StatusCode::BAD_GATEWAY,
-        Json(json!({
-            "error": {
-                "message": "All providers failed",
-                "type": "server_error",
-                "details": errors
-            }
-        })),
+        ErrorKind::Upstream,
+        "All providers failed",
+        Some(&errors),
     )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -3815,5 +3731,235 @@ mod tests {
             "tool_choice should be omitted when null, got: {:?}",
             request.get("tool_choice")
         );
+    }
+
+    // Characterization tests pinning the exact error-body shapes of both
+    // handlers. These intentionally assert the *asymmetries* between the
+    // OpenAI and Anthropic dialects so the upcoming handler refactor cannot
+    // silently change a client-visible response.
+
+    #[tokio::test]
+    async fn openai_method_not_allowed_returns_openai_error_shape() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{}/v1/chat/completions", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 405);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "error": {
+                    "message": "Only POST is supported for this endpoint",
+                    "type": "invalid_request_error"
+                }
+            })
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_method_not_allowed_returns_anthropic_error_shape() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{}/v1/messages", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 405);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Only POST is supported for this endpoint"
+                }
+            })
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn openai_invalid_json_returns_flat_error_string() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 400);
+        let body: Value = response.json().await.unwrap();
+        // OpenAI dialect: the invalid-JSON body is a *flat* string, unlike
+        // every other OpenAI error which nests under `error.{message,type}`.
+        assert!(
+            body["error"].is_string(),
+            "expected flat string error, got {body}"
+        );
+        assert!(body["error"].as_str().unwrap().starts_with("Invalid JSON"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_invalid_json_returns_nested_error_object() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", addr))
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 400);
+        let body: Value = response.json().await.unwrap();
+        // Anthropic dialect: invalid-JSON is nested, not flat.
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Invalid JSON"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn openai_missing_provider_uses_invalid_request_type() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .json(&json!({"model": "no-such-model", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 404);
+        let body: Value = response.json().await.unwrap();
+        assert!(body.get("type").is_none(), "OpenAI body has no top-level type");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["message"],
+            "No provider found for model: no-such-model"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_missing_provider_uses_not_found_type() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", addr))
+            .json(&json!({"model": "no-such-model", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 404);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        // Anthropic uses a distinct not_found_error type here.
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(
+            body["error"]["message"],
+            "No provider found for model: no-such-model"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn openai_all_providers_failed_uses_server_error_type() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .json(&json!({"model": "test-model", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 502);
+        let body: Value = response.json().await.unwrap();
+        assert!(body.get("type").is_none(), "OpenAI body has no top-level type");
+        assert_eq!(body["error"]["message"], "All providers failed");
+        assert_eq!(body["error"]["type"], "server_error");
+        assert!(body["error"]["details"].is_array());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_all_providers_failed_uses_api_error_type() {
+        let config = AppConfig {
+            providers: vec![provider("http://127.0.0.1:9".to_string(), 0)],
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (addr, task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", addr))
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 502);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["message"], "All providers failed");
+        // Anthropic uses api_error where OpenAI uses server_error.
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(body["error"]["details"].is_array());
+        task.abort();
     }
 }
