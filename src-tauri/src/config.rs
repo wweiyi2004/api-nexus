@@ -56,6 +56,16 @@ pub struct FusionConfig {
     pub max_panel_models: u8,
     #[serde(default = "default_fusion_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub web_search_daemon_url: Option<String>,
+    #[serde(default)]
+    pub enable_web_tools: bool,
+    #[serde(default = "default_fusion_max_tool_calls")]
+    pub max_tool_calls: u32,
+    #[serde(default = "default_fusion_web_search_limit")]
+    pub web_search_limit: u32,
+    #[serde(default = "default_fusion_web_fetch_max_chars")]
+    pub web_fetch_max_chars: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +176,18 @@ fn default_fusion_max_panel_models() -> u8 {
 
 fn default_fusion_timeout_secs() -> u64 {
     120
+}
+
+fn default_fusion_max_tool_calls() -> u32 {
+    8
+}
+
+fn default_fusion_web_search_limit() -> u32 {
+    5
+}
+
+fn default_fusion_web_fetch_max_chars() -> u32 {
+    30_000
 }
 
 fn default_provider_enabled() -> bool {
@@ -618,6 +640,11 @@ impl Default for FusionConfig {
             final_model: None,
             max_panel_models: default_fusion_max_panel_models(),
             timeout_secs: default_fusion_timeout_secs(),
+            web_search_daemon_url: None,
+            enable_web_tools: false,
+            max_tool_calls: default_fusion_max_tool_calls(),
+            web_search_limit: default_fusion_web_search_limit(),
+            web_fetch_max_chars: default_fusion_web_fetch_max_chars(),
         }
     }
 }
@@ -703,6 +730,24 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
         config.fusion.timeout_secs = default_fusion_timeout_secs();
     }
     config.fusion.timeout_secs = config.fusion.timeout_secs.clamp(5, 600);
+    if config.fusion.max_tool_calls == 0 {
+        config.fusion.max_tool_calls = default_fusion_max_tool_calls();
+    }
+    config.fusion.max_tool_calls = config.fusion.max_tool_calls.clamp(1, 16);
+    if config.fusion.web_search_limit == 0 {
+        config.fusion.web_search_limit = default_fusion_web_search_limit();
+    }
+    config.fusion.web_search_limit = config.fusion.web_search_limit.clamp(1, 50);
+    if config.fusion.web_fetch_max_chars == 0 {
+        config.fusion.web_fetch_max_chars = default_fusion_web_fetch_max_chars();
+    }
+    config.fusion.web_fetch_max_chars = config.fusion.web_fetch_max_chars.clamp(1_000, 200_000);
+    config.fusion.web_search_daemon_url = config
+        .fusion
+        .web_search_daemon_url
+        .take()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty());
     config.fusion.panel_models = normalize_model_refs(config.fusion.panel_models);
     config.fusion.judge_model = normalize_optional_model_ref(config.fusion.judge_model);
     config.fusion.final_model = normalize_optional_model_ref(config.fusion.final_model);
@@ -1097,5 +1142,37 @@ mod tests {
 
         config = normalize_config(config);
         assert!(config.model_prices.is_empty());
+    }
+
+    #[test]
+    fn fusion_web_tool_defaults_and_limits_are_normalized() {
+        let defaults = FusionConfig::default();
+        assert!(!defaults.enable_web_tools);
+        assert_eq!(defaults.max_tool_calls, 8);
+        assert_eq!(defaults.web_search_limit, 5);
+        assert_eq!(defaults.web_fetch_max_chars, 30_000);
+
+        let mut config = AppConfig::default();
+        config.fusion.max_tool_calls = 99;
+        config.fusion.web_search_limit = 99;
+        config.fusion.web_fetch_max_chars = 999_999;
+        config.fusion.web_search_daemon_url = Some("  http://127.0.0.1:3210/  ".into());
+        let config = normalize_config(config);
+        assert_eq!(config.fusion.max_tool_calls, 16);
+        assert_eq!(config.fusion.web_search_limit, 50);
+        assert_eq!(config.fusion.web_fetch_max_chars, 200_000);
+        assert_eq!(
+            config.fusion.web_search_daemon_url.as_deref(),
+            Some("http://127.0.0.1:3210")
+        );
+
+        let mut zeroes = AppConfig::default();
+        zeroes.fusion.max_tool_calls = 0;
+        zeroes.fusion.web_search_limit = 0;
+        zeroes.fusion.web_fetch_max_chars = 0;
+        let zeroes = normalize_config(zeroes);
+        assert_eq!(zeroes.fusion.max_tool_calls, 8);
+        assert_eq!(zeroes.fusion.web_search_limit, 5);
+        assert_eq!(zeroes.fusion.web_fetch_max_chars, 30_000);
     }
 }

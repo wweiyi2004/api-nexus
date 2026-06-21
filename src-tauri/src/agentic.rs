@@ -4,8 +4,6 @@
 //! their unit tests before a production consumer exists. The module-level
 //! `dead_code` allow is removed in Task 6, once `run_tool_loop` is wired into
 //! `fusion::call_model` and every item has a real caller.
-#![allow(dead_code)]
-
 use serde_json::{json, Value};
 
 use crate::config::Provider;

@@ -1,7 +1,5 @@
 //! Fusion web tools backed by a trusted local open-webSearch daemon.
 
-#![allow(dead_code)]
-
 use serde_json::{json, Value};
 
 use crate::agentic::{ToolCall, ToolExecutor, ToolSpec};
@@ -86,10 +84,16 @@ impl ToolExecutor for WebTools {
                     .await?;
                 format_fetch_result(&data)
             }
-            "web_search" => Err(format!(
-                "web_search is not available yet (configured limit: {})",
-                self.search_limit
-            )),
+            "web_search" => {
+                let query = required_string_argument(call, "query")?;
+                let data = self
+                    .call_daemon(
+                        "/search",
+                        json!({"query": query, "limit": self.search_limit}),
+                    )
+                    .await?;
+                Ok(format_search_result(&data))
+            }
             name => Err(format!("Unknown web tool: {name}")),
         }
     }
@@ -179,6 +183,49 @@ fn format_fetch_result(data: &Value) -> Result<String, String> {
     }
 }
 
+fn format_search_result(data: &Value) -> String {
+    let query = data
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("the query");
+    let Some(results) = data.get("results").and_then(Value::as_array) else {
+        return format!("No web results found for: {query}");
+    };
+    if results.is_empty() {
+        return format!("No web results found for: {query}");
+    }
+
+    results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let title = result
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Untitled result");
+            let url = result
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let description = result
+                .get("description")
+                .or_else(|| result.get("snippet"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut lines = vec![format!("{}. {}", index + 1, title.trim())];
+            if !url.trim().is_empty() {
+                lines.push(format!("URL: {}", url.trim()));
+            }
+            if !description.trim().is_empty() {
+                lines.push(description.trim().to_string());
+            }
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +254,27 @@ mod tests {
         }))
     }
 
+    async fn search(State(state): State<DaemonState>, Json(body): Json<Value>) -> Json<Value> {
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push(("/search".into(), body));
+        Json(json!({
+            "status": "ok",
+            "data": {
+                "query": "rust agent loop",
+                "totalResults": 2,
+                "results": [
+                    {"title": "First", "url": "https://one.example", "description": "First result"},
+                    {"title": "Second", "url": "https://two.example", "description": "Second result"}
+                ],
+                "partialFailures": []
+            },
+            "error": null
+        }))
+    }
+
     async fn daemon_error() -> (StatusCode, Json<Value>) {
         (
             StatusCode::BAD_REQUEST,
@@ -222,6 +290,7 @@ mod tests {
         let state = DaemonState::default();
         let app = Router::new()
             .route("/fetch-web", post(fetch_web))
+            .route("/search", post(search))
             .route("/error", post(daemon_error))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -266,6 +335,30 @@ mod tests {
         assert_eq!(
             requests[0].1,
             json!({"url": "https://example.com", "maxChars": 12345})
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_posts_limit_and_formats_results() {
+        let (url, state) = spawn_daemon().await;
+        let tools = WebTools::new(reqwest::Client::new(), &url, 7, 30_000).unwrap();
+        let result = tools
+            .execute(&ToolCall {
+                id: "call_1".into(),
+                name: "web_search".into(),
+                arguments: json!({"query": "rust agent loop"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            "1. First\nURL: https://one.example\nFirst result\n\n2. Second\nURL: https://two.example\nSecond result"
+        );
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests[0].0, "/search");
+        assert_eq!(
+            requests[0].1,
+            json!({"query": "rust agent loop", "limit": 7})
         );
     }
 

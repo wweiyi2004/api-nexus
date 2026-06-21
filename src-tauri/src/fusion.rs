@@ -1,8 +1,10 @@
+use crate::agentic::{self, ToolCall, ToolExecutor};
 use crate::config::{
     normalize_model_ref, normalize_model_refs, AppConfig, ModelPrice, ModelRef, Provider,
 };
 use crate::proxy::{self, TokenUsage};
 use crate::storage::{FusionRunDetails, FusionStepEntry, RequestLogStore};
+use crate::web_tools::WebTools;
 use futures::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -428,6 +430,24 @@ async fn execute_fusion(
     final_max_tokens: u64,
     totals: &mut RunTotals,
 ) -> Result<String, String> {
+    let web_tools = if config.fusion.enable_web_tools {
+        config
+            .fusion
+            .web_search_daemon_url
+            .as_deref()
+            .map(|daemon_url| {
+                WebTools::new(
+                    client.clone(),
+                    daemon_url,
+                    config.fusion.web_search_limit,
+                    config.fusion.web_fetch_max_chars,
+                )
+                .map(Arc::new)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let original_request = format_messages(messages);
     let panel_messages = with_system_message(
         messages,
@@ -446,6 +466,8 @@ async fn execute_fusion(
                 panel_messages.clone(),
                 resolved.timeout_secs,
                 DEFAULT_STAGE_MAX_TOKENS,
+                web_tools.clone(),
+                config.fusion.max_tool_calls,
             )
         })
         .collect::<Vec<_>>();
@@ -495,6 +517,8 @@ async fn execute_fusion(
         judge_messages,
         resolved.timeout_secs,
         DEFAULT_STAGE_MAX_TOKENS,
+        web_tools,
+        config.fusion.max_tool_calls,
     )
     .await;
     record_step(store, run_id, "judge", &judge_outcome, totals).await?;
@@ -532,6 +556,8 @@ async fn execute_fusion(
         final_messages,
         resolved.timeout_secs,
         final_max_tokens,
+        None,
+        0,
     )
     .await;
     record_step(store, run_id, "final", &final_outcome, totals).await?;
@@ -579,6 +605,7 @@ async fn record_step(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_model(
     client: Client,
     config: AppConfig,
@@ -586,11 +613,20 @@ async fn call_model(
     messages: Vec<Value>,
     timeout_secs: u64,
     max_tokens: u64,
+    web_tools: Option<Arc<WebTools>>,
+    max_tool_calls: u32,
 ) -> ModelCallOutcome {
     let started = Instant::now();
     let result = timeout(
         Duration::from_secs(timeout_secs),
-        call_model_inner(&client, &target, messages, max_tokens),
+        call_model_inner(
+            &client,
+            &target,
+            messages,
+            max_tokens,
+            web_tools.as_deref(),
+            max_tool_calls,
+        ),
     )
     .await
     .unwrap_or_else(|_| Err(format!("Timed out after {timeout_secs}s")));
@@ -624,69 +660,61 @@ async fn call_model_inner(
     target: &ResolvedModel,
     messages: Vec<Value>,
     max_tokens: u64,
+    web_tools: Option<&WebTools>,
+    max_tool_calls: u32,
 ) -> Result<(String, TokenUsage), String> {
-    let openai_body = json!({
-        "model": target.model_ref.model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "stream": false
-    });
+    let tools = web_tools.map(WebTools::specs).unwrap_or_default();
+    let executor: &dyn ToolExecutor = web_tools
+        .map(|tools| tools as &dyn ToolExecutor)
+        .unwrap_or(&NO_TOOLS_EXECUTOR);
+    let effective_max_tool_calls = if tools.is_empty() { 0 } else { max_tool_calls };
 
-    if proxy::is_anthropic_provider(&target.provider) {
-        let body = proxy::openai_to_anthropic_request(&openai_body)?;
-        let url = proxy::anthropic_upstream_url(&target.provider.base_url, "/v1/messages");
-        let response = client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("x-api-key", &target.provider.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!("HTTP {} - {}", status.as_u16(), text));
-        }
-        let body: Value = serde_json::from_str(&text)
-            .map_err(|error| format!("Failed to parse Anthropic response: {error}"))?;
-        let usage = proxy::extract_token_usage(&body);
-        let content = content_text(body.get("content").unwrap_or(&Value::Null));
-        return Ok((non_empty_model_content(content)?, usage));
-    }
-
-    let url = proxy::openai_upstream_url(&target.provider.base_url, "/v1/chat/completions");
-    let response = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!("Bearer {}", target.provider.api_key),
-        )
-        .json(&openai_body)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("HTTP {} - {}", status.as_u16(), text));
-    }
-    let body: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("Failed to parse OpenAI response: {error}"))?;
-    let usage = proxy::extract_token_usage(&body);
-    let content = openai_response_text(&body);
-    Ok((non_empty_model_content(content)?, usage))
-}
-
-fn non_empty_model_content(content: String) -> Result<String, String> {
-    if content.trim().is_empty() {
-        Err("empty model response".to_string())
+    let (system, messages) = if proxy::is_anthropic_provider(&target.provider) {
+        let openai_body = json!({
+            "model": target.model_ref.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": false
+        });
+        let converted = proxy::openai_to_anthropic_request(&openai_body)?;
+        let system = converted
+            .get("system")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let messages = converted
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        (system, messages)
     } else {
-        Ok(content)
+        (None, messages)
+    };
+
+    agentic::run_tool_loop(
+        client,
+        &target.provider,
+        &target.model_ref.model,
+        system.as_deref(),
+        messages,
+        max_tokens,
+        &tools,
+        executor,
+        effective_max_tool_calls,
+    )
+    .await
+}
+
+struct NoToolsExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for NoToolsExecutor {
+    async fn execute(&self, _call: &ToolCall) -> Result<String, String> {
+        Err("No tools configured".to_string())
     }
 }
+
+static NO_TOOLS_EXECUTOR: NoToolsExecutor = NoToolsExecutor;
 
 fn resolve_fusion_models(
     config: &AppConfig,
@@ -867,18 +895,6 @@ fn content_text(content: &Value) -> String {
     }
 }
 
-fn openai_response_text(body: &Value) -> String {
-    let Some(message) = body
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-    else {
-        return String::new();
-    };
-    content_text(message.get("content").unwrap_or(&Value::Null))
-}
-
 fn estimate_cost(config: &AppConfig, provider: &Provider, model: &str, usage: TokenUsage) -> f64 {
     let model_key = model.trim().to_ascii_lowercase();
     let provider_price = config.model_prices.iter().find(|price| {
@@ -912,6 +928,54 @@ fn calculate_cost(provider: &Provider, price: &ModelPrice, usage: TokenUsage) ->
 mod tests {
     use super::*;
     use crate::config::FusionConfig;
+    use axum::{extract::State, routing::post, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    #[derive(Clone, Default)]
+    struct WebIntegrationState {
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn tool_calling_model(
+        State(state): State<WebIntegrationState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.requests.lock().unwrap().push(body);
+        if state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Json(json!({
+                "choices": [{"message": {"role": "assistant", "content": null,
+                    "tool_calls": [{"id": "search_1", "type": "function", "function": {
+                        "name": "web_search", "arguments": "{\"query\":\"current docs\"}"
+                    }}]
+                }}]
+            }))
+        } else {
+            Json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "answer with sources"}}]
+            }))
+        }
+    }
+
+    async fn search_daemon(Json(_body): Json<Value>) -> Json<Value> {
+        Json(json!({
+            "status": "ok",
+            "data": {"query": "current docs", "results": [{
+                "title": "Documentation", "url": "https://docs.example", "description": "Current reference"
+            }]},
+            "error": null
+        }))
+    }
+
+    async fn spawn_test_router(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
 
     #[test]
     fn openai_response_shape_contains_final_content() {
@@ -1036,5 +1100,55 @@ mod tests {
 
         let resolved = resolve_fusion_models(&config, None).unwrap();
         assert_eq!(resolved.final_model.model_ref.model, "m2");
+    }
+
+    #[tokio::test]
+    async fn call_model_inner_routes_web_search_results_back_to_panel_model() {
+        let state = WebIntegrationState::default();
+        let model_url = spawn_test_router(
+            Router::new()
+                .route("/v1/chat/completions", post(tool_calling_model))
+                .with_state(state.clone()),
+        )
+        .await;
+        let daemon_url =
+            spawn_test_router(Router::new().route("/search", post(search_daemon))).await;
+        let client = reqwest::Client::new();
+        let web_tools = WebTools::new(client.clone(), &daemon_url, 5, 30_000).unwrap();
+        let target = ResolvedModel {
+            model_ref: ModelRef {
+                provider_id: "panel".into(),
+                model: "panel-model".into(),
+            },
+            provider: Provider {
+                id: "panel".into(),
+                name: "Panel".into(),
+                base_url: model_url,
+                api_key: "secret".into(),
+                models: vec!["panel-model".into()],
+                enabled: true,
+                ..Default::default()
+            },
+        };
+
+        let (content, _) = call_model_inner(
+            &client,
+            &target,
+            vec![json!({"role": "user", "content": "question"})],
+            512,
+            Some(&web_tools),
+            4,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(content, "answer with sources");
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tools"][0]["function"]["name"], "web_search");
+        assert!(requests[1]["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("https://docs.example"));
     }
 }
