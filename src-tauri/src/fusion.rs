@@ -1,4 +1,5 @@
 use crate::agentic::{self, ToolCall, ToolExecutor, ToolSpec};
+use crate::anthropic;
 use crate::config::{
     normalize_model_ref, normalize_model_refs, AppConfig, ModelPrice, ModelRef, Provider,
 };
@@ -359,28 +360,91 @@ pub async fn run_from_responses_request(
     }
 }
 
+pub async fn run_from_anthropic_client_request(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    body: &Value,
+) -> Result<CompletedResponsesTurn, FusionError> {
+    let request = anthropic::parse_request(body).map_err(FusionError::bad_request)?;
+    let overrides = fusion_overrides_from_body(body);
+    if config.fusion.mode == "on_demand" {
+        run_on_demand_client_turn(
+            client,
+            store,
+            config,
+            "anthropic",
+            request.messages,
+            request.client_tools,
+            request.max_output_tokens,
+            request.require_tool,
+            overrides,
+        )
+        .await
+    } else {
+        run_forced_client_turn(
+            client,
+            store,
+            config,
+            "anthropic",
+            request.messages,
+            request.client_tools,
+            request.max_output_tokens,
+            request.require_tool,
+            overrides,
+        )
+        .await
+    }
+}
+
 async fn run_forced_responses(
     client: &Client,
     store: &Arc<RequestLogStore>,
     config: &AppConfig,
     request: ParsedResponsesRequest,
 ) -> Result<CompletedResponsesTurn, FusionError> {
+    run_forced_client_turn(
+        client,
+        store,
+        config,
+        "responses",
+        request.messages,
+        request.client_tools,
+        request.max_output_tokens,
+        request.require_tool,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_forced_client_turn(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    input_protocol: &str,
+    messages: Vec<Value>,
+    client_tools: Vec<ClientTool>,
+    max_output_tokens: u64,
+    require_tool: bool,
+    overrides: Option<FusionModelOverride>,
+) -> Result<CompletedResponsesTurn, FusionError> {
     let analysis = run_with_messages(
         client,
         store,
         config,
-        "responses".to_string(),
+        input_protocol.to_string(),
         None,
-        request.messages.clone(),
-        None,
+        messages.clone(),
+        overrides.clone(),
         None,
         false,
     )
     .await?;
-    let resolved = resolve_fusion_models(config, None).map_err(FusionError::bad_request)?;
+    let resolved = resolve_fusion_models(config, overrides).map_err(FusionError::bad_request)?;
     let mut final_messages = with_system_message(
-        &request.messages,
-        "You are API Nexus Fusion's final coding model. Use the judge analysis to continue the Codex turn. Call a client tool when repository inspection or modification is needed; otherwise answer the user directly.",
+        &messages,
+        "You are API Nexus Fusion's final coding model. Use the judge analysis to continue the client turn. Call a client tool when repository inspection or modification is needed; otherwise answer the user directly.",
     );
     final_messages.push(json!({
         "role": "user",
@@ -391,12 +455,12 @@ async fn run_forced_responses(
         client,
         &resolved.final_model,
         final_messages,
-        request.max_output_tokens,
+        max_output_tokens,
         &[],
-        &request.client_tools,
+        &client_tools,
         &NO_TOOLS_EXECUTOR,
         0,
-        request.require_tool,
+        require_tool,
     )
     .await;
     let final_latency_ms = final_started.elapsed().as_millis() as u64;
@@ -496,6 +560,32 @@ async fn run_on_demand_responses(
     config: &AppConfig,
     request: ParsedResponsesRequest,
 ) -> Result<CompletedResponsesTurn, FusionError> {
+    run_on_demand_client_turn(
+        client,
+        store,
+        config,
+        "responses",
+        request.messages,
+        request.client_tools,
+        request.max_output_tokens,
+        request.require_tool,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_on_demand_client_turn(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    input_protocol: &str,
+    messages: Vec<Value>,
+    client_tools: Vec<ClientTool>,
+    max_output_tokens: u64,
+    require_tool: bool,
+    overrides: Option<FusionModelOverride>,
+) -> Result<CompletedResponsesTurn, FusionError> {
     if !config.fusion.enabled {
         return Err(FusionError::bad_request("Fusion is disabled in settings"));
     }
@@ -511,28 +601,28 @@ async fn run_on_demand_responses(
     }
     let outer = resolve_model_ref(config, outer_ref).map_err(FusionError::bad_request)?;
     let outer_messages = with_system_message(
-        &request.messages,
-        "You are the outer coding model for API Nexus Fusion. Answer the Codex turn directly or call a Codex client tool. Call the server-side fusion tool when independent panel analysis would materially improve correctness. Never return the fusion tool to the client.",
+        &messages,
+        "You are the outer coding model for API Nexus Fusion. Answer the client turn directly or call a client tool. Call the server-side fusion tool when independent panel analysis would materially improve correctness. Never return the fusion tool to the client.",
     );
     let executor = FusionToolExecutor {
         client: client.clone(),
         store: store.clone(),
         config: config.clone(),
-        input_protocol: "responses".to_string(),
-        messages: request.messages,
-        overrides: None,
+        input_protocol: input_protocol.to_string(),
+        messages,
+        overrides,
         usage: tokio::sync::Mutex::new(TokenUsage::default()),
     };
     let outcome = run_client_capable_model(
         client,
         &outer,
         outer_messages,
-        request.max_output_tokens,
+        max_output_tokens,
         &[fusion_tool_spec()],
-        &request.client_tools,
+        &client_tools,
         &executor,
         1,
-        request.require_tool,
+        require_tool,
     )
     .await
     .map_err(FusionError::upstream)?;

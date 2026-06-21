@@ -76,7 +76,7 @@ npx open-websearch serve
 
 In the Fusion page, enable web tools and enter the loopback daemon URL printed by that command (for example, `http://127.0.0.1:3210`). API Nexus accepts only `localhost`, `127.0.0.1`, or `::1` daemon hosts. When web tools are disabled or no daemon URL is configured, Fusion uses its original single-request model calls.
 
-Fusion proxy routing supports two modes. `forced` always runs panel, judge, and final stages. `on_demand` sends the request to the configured outer model with a server-side `fusion` tool; the outer model can answer directly or invoke panel/judge analysis and then write the final response. Clients can force that invocation with OpenAI `tool_choice: "required"` or Anthropic `tool_choice: {"type":"any"}`. Streaming remains unsupported for both modes.
+Fusion proxy routing supports two modes. `forced` always runs panel, judge, and final stages. `on_demand` sends the request to the configured outer model with a server-side `fusion` tool; the outer model can answer directly or invoke panel/judge analysis and then write the final response. Clients can force that invocation with OpenAI `tool_choice: "required"` or Anthropic `tool_choice: {"type":"any"}`. The Responses and Anthropic Messages entrypoints accept streaming requests and emit protocol-correct SSE after internal Fusion orchestration completes; OpenAI chat-completions Fusion remains non-streaming.
 
 ## Release Automation
 
@@ -104,6 +104,19 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:11434
 ```
 
 Use the proxy API key configured in API Nexus as the client API key.
+
+### Claude Code
+
+Claude Code can use Fusion over the Anthropic Messages API, including built-in client tools such as `Bash`, `Read`, `Edit`, and `Write`. Set process-local environment variables before starting Claude Code:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:11434"
+$env:ANTHROPIC_AUTH_TOKEN = "sk-nexus-your-key"
+$env:ANTHROPIC_MODEL = "nexus/fusion"
+claude
+```
+
+Claude Code CLI `2.1.185` is covered by a real CLI integration test, including an Anthropic SSE `tool_use`, local `Bash` execution, and the follow-up `tool_result`. Fusion also handles `/v1/messages/count_tokens` locally.
 
 ### Codex CLI
 

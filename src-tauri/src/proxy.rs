@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use crate::anthropic;
 use crate::config::{AppConfig, Provider};
 use crate::fusion;
 use crate::responses;
@@ -1081,7 +1082,7 @@ fn anthropic_message_to_openai_messages(message: &Value) -> Vec<Value> {
 
     if !text_parts.is_empty() || openai_messages.is_empty() {
         openai_messages.push(json!({
-            "role": "user",
+            "role": if role == "system" { "system" } else { "user" },
             "content": text_parts.join("\n")
         }));
     }
@@ -1887,6 +1888,24 @@ async fn try_fusion(
         request_body: prepared.request_body_for_log.clone(),
     };
 
+    if matches!(dialect, ApiDialect::Anthropic)
+        && prepared.request_path == "/v1/messages/count_tokens"
+    {
+        log_request_with_body(
+            &state.request_logs,
+            &fusion_log(200),
+            TokenUsage::default(),
+            None,
+        )
+        .await;
+        return Some(
+            Json(json!({
+                "input_tokens": estimate_anthropic_tokens(&prepared.body_json)
+            }))
+            .into_response(),
+        );
+    }
+
     if prepared.request_path != expected_path {
         let message = format!("Fusion is only supported on {}", expected_path);
         log_request_with_body(
@@ -1905,6 +1924,99 @@ async fn try_fusion(
     }
 
     let config = state.config.read().await.clone();
+    if matches!(dialect, ApiDialect::Anthropic) {
+        let result = fusion::run_from_anthropic_client_request(
+            &state.client,
+            &state.request_logs,
+            &config,
+            &prepared.body_json,
+        )
+        .await;
+        return Some(match result {
+            Ok(turn) => {
+                let message = match anthropic::completed_message(
+                    &prepared.model,
+                    turn.text.as_deref(),
+                    &turn.tool_calls,
+                    turn.usage,
+                ) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        log_request_with_body(
+                            &state.request_logs,
+                            &fusion_log(502),
+                            TokenUsage::default(),
+                            Some(error.clone()),
+                        )
+                        .await;
+                        return Some(dialect.error_response(
+                            StatusCode::BAD_GATEWAY,
+                            ErrorKind::Upstream,
+                            &error,
+                            None,
+                        ));
+                    }
+                };
+                record_token_usage(&state.token_stats, turn.usage).await;
+                log_request_with_body(&state.request_logs, &fusion_log(200), turn.usage, None)
+                    .await;
+                if prepared.is_stream {
+                    match anthropic::sse_body(&message) {
+                        Ok(body) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            )
+                            .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+                            .body(Body::from(body))
+                            .unwrap_or_else(|error| {
+                                dialect.error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    ErrorKind::Upstream,
+                                    &format!("Failed to build Fusion stream: {error}"),
+                                    None,
+                                )
+                            }),
+                        Err(error) => dialect.error_response(
+                            StatusCode::BAD_GATEWAY,
+                            ErrorKind::Upstream,
+                            &error,
+                            None,
+                        ),
+                    }
+                } else {
+                    Json(message).into_response()
+                }
+            }
+            Err(error) => {
+                let status = if error.is_bad_request() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                let message = error.to_string();
+                log_request_with_body(
+                    &state.request_logs,
+                    &fusion_log(status.as_u16()),
+                    TokenUsage::default(),
+                    Some(message.clone()),
+                )
+                .await;
+                dialect.error_response(
+                    status,
+                    if status == StatusCode::BAD_REQUEST {
+                        ErrorKind::BadRequest
+                    } else {
+                        ErrorKind::Upstream
+                    },
+                    &message,
+                    None,
+                )
+            }
+        });
+    }
+
     let run_result = if config.fusion.mode == "on_demand" {
         match dialect {
             ApiDialect::OpenAI => fusion::run_on_demand_from_openai_request(
@@ -3671,6 +3783,123 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a locally installed Claude Code CLI"]
+    async fn claude_code_cli_can_use_fusion_messages_provider() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    let model = body["model"].as_str().unwrap_or_default();
+                    let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| message["role"] == "tool")
+                    });
+                    let message = if model == "final" && !has_tool_output {
+                        json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "toolu_claude_e2e",
+                                "type": "function",
+                                "function": {
+                                    "name": "Bash",
+                                    "arguments": "{\"command\":\"printf CLAUDE_TOOL_OK\"}"
+                                }
+                            }]
+                        })
+                    } else if model == "final" {
+                        json!({"role": "assistant", "content": "OK"})
+                    } else {
+                        json!({"role": "assistant", "content": format!("analysis from {model}")})
+                    };
+                    Json(json!({
+                        "choices": [{"message": message}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            proxy_api_key: "sk-claude-e2e".to_string(),
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "claude"]);
+            command
+        } else {
+            tokio::process::Command::new("claude")
+        };
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            command
+                .args([
+                    "-p",
+                    "Complete the requested tool step, then reply with exactly OK.",
+                    "--model",
+                    "nexus/fusion",
+                    "--output-format",
+                    "json",
+                    "--dangerously-skip-permissions",
+                    "--no-session-persistence",
+                ])
+                .env("ANTHROPIC_BASE_URL", format!("http://{proxy_addr}"))
+                .env("ANTHROPIC_AUTH_TOKEN", "sk-claude-e2e")
+                .env("ANTHROPIC_MODEL", "nexus/fusion")
+                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .env_remove("ANTHROPIC_API_KEY")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("Claude Code CLI timed out")
+        .expect("failed to launch Claude Code CLI");
+
+        assert!(
+            output.status.success(),
+            "Claude Code failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"result\":\"OK\""), "stdout={stdout}");
+        let requests = captured_requests.lock().unwrap();
+        assert!(requests.iter().any(|request| {
+            request["model"] == "final"
+                && request["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "tool"
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|content| content.contains("CLAUDE_TOOL_OK"))
+                    })
+                })
+        }));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
     async fn openai_fusion_final_inherits_requested_max_tokens() {
         let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let captured_for_handler = captured_requests.clone();
@@ -3969,6 +4198,267 @@ mod tests {
         assert_eq!(body["type"], "message");
         assert_eq!(body["model"], "nexus/fusion");
         assert_eq!(body["content"][0]["text"], "answer from final");
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_fusion_stream_round_trips_a_claude_code_tool() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    let model = body["model"].as_str().unwrap_or_default();
+                    let has_tool_output = body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| message["role"] == "tool")
+                    });
+                    let message = if model == "final" && !has_tool_output {
+                        json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "toolu_bash_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "Bash",
+                                    "arguments": "{\"command\":\"Write-Output CLAUDE_TOOL_OK\"}"
+                                }
+                            }]
+                        })
+                    } else if model == "final" {
+                        json!({"role": "assistant", "content": "Repository inspected."})
+                    } else {
+                        json!({"role": "assistant", "content": format!("analysis from {model}")})
+                    };
+                    Json(json!({
+                        "choices": [{"message": message}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+        let client = reqwest::Client::new();
+        let tool = json!({
+            "name": "Bash",
+            "description": "Run a shell command",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        });
+
+        let first = client
+            .post(format!("http://{}/v1/messages?beta=true", proxy_addr))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&json!({
+                "model": "nexus/fusion",
+                "system": [{"type": "text", "text": "You are Claude Code."}],
+                "messages": [{"role": "user", "content": "Inspect the repository"}],
+                "tools": [tool.clone()],
+                "max_tokens": 32000,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let first_sse = first.text().await.unwrap();
+        assert!(first_sse.contains("event: message_start"));
+        assert!(first_sse.contains("\"stop_reason\":\"tool_use\""));
+        assert!(first_sse.contains("\"name\":\"Bash\""));
+        assert!(first_sse.contains("CLAUDE_TOOL_OK"));
+
+        let second = client
+            .post(format!("http://{}/v1/messages?beta=true", proxy_addr))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&json!({
+                "model": "nexus/fusion",
+                "system": [{"type": "text", "text": "You are Claude Code."}],
+                "messages": [
+                    {"role": "user", "content": "Inspect the repository"},
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use", "id": "toolu_bash_1", "name": "Bash",
+                        "input": {"command": "Write-Output CLAUDE_TOOL_OK"}
+                    }]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "toolu_bash_1",
+                        "content": "CLAUDE_TOOL_OK"
+                    }]}
+                ],
+                "tools": [tool],
+                "max_tokens": 32000,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_sse = second.text().await.unwrap();
+        assert!(second_sse.contains("Repository inspected."));
+        assert!(second_sse.contains("\"stop_reason\":\"end_turn\""));
+
+        let requests = captured_requests.lock().unwrap();
+        let first_final = requests
+            .iter()
+            .find(|request| {
+                request["model"] == "final"
+                    && request["messages"].as_array().is_some_and(|messages| {
+                        !messages.iter().any(|message| message["role"] == "tool")
+                    })
+            })
+            .unwrap();
+        assert_eq!(first_final["tools"][0]["function"]["name"], "Bash");
+        assert!(requests.iter().any(|request| {
+            request["model"] == "final"
+                && request["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "tool" && message["content"] == "CLAUDE_TOOL_OK"
+                    })
+                })
+        }));
+
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_fusion_count_tokens_does_not_require_an_upstream_route() {
+        let config = AppConfig {
+            fusion: fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages/count_tokens", proxy_addr))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&json!({
+                "model": "nexus/fusion",
+                "messages": [{"role": "user", "content": "count this"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["input_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0));
+
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_on_demand_fusion_can_return_a_claude_client_tool() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push(body);
+                    Json(json!({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "toolu_outer_bash",
+                                "type": "function",
+                                "function": {
+                                    "name": "Bash",
+                                    "arguments": "{\"command\":\"pwd\"}"
+                                }
+                            }]
+                        }}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(),
+                    "panel-b".to_string(),
+                    "judge".to_string(),
+                    "final".to_string(),
+                    "outer".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: on_demand_fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router(Arc::new(RwLock::new(config)));
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&json!({
+                "model": "nexus/fusion",
+                "messages": [{"role": "user", "content": "Inspect the directory"}],
+                "tools": [{
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "max_tokens": 1024,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let sse = response.text().await.unwrap();
+        assert!(sse.contains("toolu_outer_bash"));
+        assert!(sse.contains("\"name\":\"Bash\""));
+        let requests = captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let tool_names = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"fusion"));
+        assert!(tool_names.contains(&"Bash"));
 
         upstream_task.abort();
         proxy_task.abort();
