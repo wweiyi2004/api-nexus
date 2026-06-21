@@ -18,6 +18,40 @@ use tokio::time::{timeout, Duration};
 
 pub const FUSION_MODEL_ID: &str = "nexus/fusion";
 const DEFAULT_STAGE_MAX_TOKENS: u64 = 2048;
+const FUSION_PANEL_PROMPT: &str = r#"You are one independent panel model in API Nexus Fusion.
+
+Answer the user's request directly and independently. Focus on:
+- Correctness and factual consistency
+- Completeness against the original request
+- Concrete, actionable details
+- Explicit assumptions when context is missing
+- Risks, edge cases, or uncertainty that could change the answer
+
+Do not mention that you are part of a panel. Do not defer to other models. If the request cannot be answered reliably from the available context, say what is missing and give the best bounded answer you can."#;
+const FUSION_JUDGE_PROMPT: &str = r#"You are the API Nexus Fusion judge.
+
+Evaluate the panel outputs against the original request. Do not write the final user-facing answer.
+Do not average weak answers. Prefer the most correct, specific, and well-supported panel output. If all panel outputs are weak, say so explicitly.
+
+Assess:
+1. Correctness and factual consistency
+2. Completeness against the original request
+3. Actionability and specificity
+4. Awareness of missing context, risk, and uncertainty
+5. Contradictions or unsupported claims across panels
+
+Return exactly these sections:
+- Verdict
+- Strongest panel and why
+- Errors or unsupported claims
+- Missing context or risks
+- Recommended synthesis plan"#;
+const FUSION_FINAL_PROMPT: &str = r#"You are API Nexus Fusion.
+
+Synthesize one final answer for the user from the original request, panel outputs, and judge analysis.
+Use the judge's critique to select the strongest claims and discard weak or unsupported ones.
+Write naturally and directly. Do not expose hidden orchestration, panel names, or judge details unless doing so is directly useful to the user.
+If the evidence is incomplete or conflicting, state the practical uncertainty and give the best next step."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusionErrorKind {
@@ -248,6 +282,7 @@ pub async fn run_from_openai_request(
         .and_then(Value::as_array)
         .cloned()
         .ok_or_else(|| FusionError::bad_request("Fusion requires OpenAI chat messages"))?;
+    let messages = messages_for_fusion_input(messages);
     let overrides = fusion_overrides_from_body(body);
     let final_max_tokens = requested_max_tokens(body);
     run_with_messages(
@@ -279,6 +314,7 @@ pub async fn run_from_anthropic_request(
         .and_then(Value::as_array)
         .cloned()
         .ok_or_else(|| FusionError::bad_request("Fusion requires Anthropic messages"))?;
+    let messages = messages_for_fusion_input(messages);
     let overrides = fusion_overrides_from_body(body);
     let final_max_tokens = requested_max_tokens(body);
     run_with_messages(
@@ -307,6 +343,7 @@ pub async fn run_on_demand_from_openai_request(
         .and_then(Value::as_array)
         .cloned()
         .ok_or_else(|| FusionError::bad_request("Fusion requires OpenAI chat messages"))?;
+    let messages = messages_for_fusion_input(messages);
     run_on_demand_with_messages(
         client,
         store,
@@ -334,6 +371,7 @@ pub async fn run_on_demand_from_anthropic_request(
         .and_then(Value::as_array)
         .cloned()
         .ok_or_else(|| FusionError::bad_request("Fusion requires Anthropic messages"))?;
+    let messages = messages_for_fusion_input(messages);
     run_on_demand_with_messages(
         client,
         store,
@@ -1088,10 +1126,7 @@ async fn execute_fusion(
         None
     };
     let original_request = format_messages(messages);
-    let panel_messages = with_system_message(
-        messages,
-        "You are one independent panel model in API Nexus Fusion. Answer the user's request directly. Prioritize correctness, concrete reasoning, and useful details. Do not mention that you are part of a panel.",
-    );
+    let panel_messages = with_system_message(messages, FUSION_PANEL_PROMPT);
 
     let panel_calls = resolved
         .panels
@@ -1138,7 +1173,7 @@ async fn execute_fusion(
     let judge_messages = vec![
         json!({
             "role": "system",
-            "content": "You are the API Nexus Fusion judge. Compare the panel outputs without writing the final answer. Return structured analysis with these sections: Consensus, Disagreements, Missing context or risks, Unique insights, Recommended synthesis."
+            "content": FUSION_JUDGE_PROMPT
         }),
         json!({
             "role": "user",
@@ -1180,7 +1215,7 @@ async fn execute_fusion(
     let final_messages = vec![
         json!({
             "role": "system",
-            "content": "You are API Nexus Fusion. Synthesize one final answer for the user from the original request, panel outputs, and judge analysis. Write naturally and do not expose hidden process unless it is directly useful."
+            "content": FUSION_FINAL_PROMPT
         }),
         json!({
             "role": "user",
@@ -1498,6 +1533,22 @@ fn is_client_tool_result_followup(messages: &[Value]) -> bool {
     ) == Some(true)
 }
 
+fn messages_for_fusion_input(messages: Vec<Value>) -> Vec<Value> {
+    if messages.iter().any(has_structured_tool_history) {
+        messages_for_fusion_analysis(&messages)
+    } else {
+        messages
+    }
+}
+
+fn has_structured_tool_history(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("tool")
+        || message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+}
+
 fn messages_for_fusion_analysis(messages: &[Value]) -> Vec<Value> {
     let mut transcript = Vec::new();
     for message in messages {
@@ -1743,6 +1794,55 @@ mod tests {
         assert!(content.contains("client tool result (call_1): API Nexus"));
         assert!(!content.contains("large coding-agent instructions"));
         assert!(analysis[0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn fusion_input_only_flattens_structured_tool_history() {
+        let plain = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "assistant", "content": "second"}),
+        ];
+        assert_eq!(messages_for_fusion_input(plain.clone()), plain);
+
+        let with_tools = vec![
+            json!({"role": "system", "content": "client system"}),
+            json!({"role": "assistant", "content": "checking", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "Read", "arguments": "{}"}
+            }]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "file"}),
+        ];
+        let flattened = messages_for_fusion_input(with_tools);
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(flattened[0]["role"], "user");
+        let content = flattened[0]["content"].as_str().unwrap();
+        assert!(content.contains("assistant: checking"));
+        assert!(content.contains("assistant requested client tools: Read"));
+        assert!(content.contains("client tool result (call_1): file"));
+        assert!(!content.contains("client system"));
+        assert!(flattened[0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn fusion_prompts_encode_panel_judge_and_final_duties() {
+        assert!(FUSION_PANEL_PROMPT.contains("independently"));
+        assert!(FUSION_PANEL_PROMPT.contains("Explicit assumptions"));
+        assert!(FUSION_PANEL_PROMPT.contains("Risks, edge cases"));
+
+        for section in [
+            "Verdict",
+            "Strongest panel and why",
+            "Errors or unsupported claims",
+            "Missing context or risks",
+            "Recommended synthesis plan",
+        ] {
+            assert!(FUSION_JUDGE_PROMPT.contains(section));
+        }
+        assert!(FUSION_JUDGE_PROMPT.contains("Do not average weak answers"));
+        assert!(FUSION_JUDGE_PROMPT.contains("Do not write the final user-facing answer"));
+
+        assert!(FUSION_FINAL_PROMPT.contains("discard weak or unsupported"));
+        assert!(FUSION_FINAL_PROMPT.contains("Do not expose hidden orchestration"));
     }
 
     #[test]

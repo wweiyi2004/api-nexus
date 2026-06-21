@@ -5,6 +5,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
@@ -26,6 +27,56 @@ pub struct ServerStatus {
     pub port: u16,
     pub host: String,
     pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlaygroundRequest {
+    pub provider_id: String,
+    pub model: String,
+    #[serde(default = "default_playground_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    pub user_prompt: String,
+    #[serde(default = "default_playground_max_tokens")]
+    pub max_tokens: u32,
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub image_size: Option<String>,
+    #[serde(default)]
+    pub image_count: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaygroundResponse {
+    pub status: u16,
+    pub success: bool,
+    pub url: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub protocol: String,
+    pub model: String,
+    pub content: String,
+    pub images: Vec<PlaygroundImage>,
+    pub usage: proxy::TokenUsage,
+    pub raw_body: Value,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaygroundImage {
+    pub url: Option<String>,
+    pub b64_json: Option<String>,
+    pub mime_type: Option<String>,
+    pub revised_prompt: Option<String>,
+}
+
+fn default_playground_mode() -> String {
+    "chat".to_string()
+}
+
+fn default_playground_max_tokens() -> u32 {
+    512
 }
 
 #[tauri::command]
@@ -380,6 +431,259 @@ pub async fn test_provider(
     }))
 }
 
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(value_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(record) => {
+            if let Some(text) = record.get("text").and_then(Value::as_str) {
+                return text.to_string();
+            }
+            if let Some(text) = record.get("content").map(value_text) {
+                return text;
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn openai_response_text(body: &Value) -> String {
+    body.get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| {
+            choice
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .or_else(|| choice.get("text"))
+        })
+        .map(value_text)
+        .unwrap_or_default()
+}
+
+fn anthropic_response_text(body: &Value) -> String {
+    body.get("content").map(value_text).unwrap_or_default()
+}
+
+fn extract_playground_images(body: &Value) -> Vec<PlaygroundImage> {
+    let Some(items) = body.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(Value::as_str).map(str::to_string);
+            let b64_json = item
+                .get("b64_json")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if url.is_none() && b64_json.is_none() {
+                return None;
+            }
+
+            Some(PlaygroundImage {
+                url,
+                b64_json,
+                mime_type: item
+                    .get("mime_type")
+                    .or_else(|| item.get("mime"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                revised_prompt: item
+                    .get("revised_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn response_error_message(body: &Value) -> Option<String> {
+    if let Some(error) = body.get("error") {
+        if let Some(message) = error.as_str() {
+            return Some(message.to_string());
+        }
+        if let Some(message) = error.get("message").and_then(Value::as_str) {
+            return Some(message.to_string());
+        }
+    }
+    body.get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[tauri::command]
+pub async fn run_playground(
+    state: tauri::State<'_, Arc<AppState>>,
+    request: PlaygroundRequest,
+) -> Result<PlaygroundResponse, String> {
+    let provider = {
+        let config = state.config.read().await;
+        config
+            .providers
+            .iter()
+            .find(|provider| provider.id == request.provider_id)
+            .cloned()
+            .ok_or_else(|| format!("Provider not found: {}", request.provider_id))?
+    };
+
+    if !provider.enabled {
+        return Err(format!("Provider is disabled: {}", provider.name));
+    }
+    let model = request.model.trim().to_string();
+    let system_prompt = request.system_prompt;
+    let user_prompt = request.user_prompt;
+
+    if model.is_empty() {
+        return Err("Model is required".to_string());
+    }
+    if user_prompt.trim().is_empty() {
+        return Err("User prompt is required".to_string());
+    }
+    if provider.base_url.trim().is_empty() {
+        return Err("Provider base URL is required".to_string());
+    }
+    if provider.api_key.trim().is_empty() {
+        return Err("Provider API key is required".to_string());
+    }
+
+    let protocol = provider.protocol.to_ascii_lowercase();
+    let is_anthropic = protocol == "anthropic";
+    let mode = if request.mode.eq_ignore_ascii_case("image") {
+        "image"
+    } else {
+        "chat"
+    };
+    if mode == "image" && is_anthropic {
+        return Err("Anthropic Messages protocol does not support image generation".to_string());
+    }
+    let max_tokens = request.max_tokens.clamp(1, 128_000);
+    let started = Instant::now();
+
+    let (url, body) = if mode == "image" {
+        let size = request
+            .image_size
+            .as_deref()
+            .map(str::trim)
+            .filter(|size| !size.is_empty())
+            .unwrap_or("1024x1024");
+        let image_count = request.image_count.unwrap_or(1).clamp(1, 4);
+        (
+            proxy::openai_upstream_url(&provider.base_url, "/v1/images/generations"),
+            json!({
+                "model": model.clone(),
+                "prompt": user_prompt,
+                "n": image_count,
+                "size": size
+            }),
+        )
+    } else if is_anthropic {
+        let mut messages = Vec::new();
+        messages.push(json!({"role": "user", "content": user_prompt}));
+        let mut body = json!({
+            "model": model.clone(),
+            "max_tokens": max_tokens,
+            "messages": messages
+        });
+        if !system_prompt.trim().is_empty() {
+            body["system"] = Value::String(system_prompt);
+        }
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature.clamp(0.0, 2.0));
+        }
+        (
+            proxy::anthropic_upstream_url(&provider.base_url, "/v1/messages"),
+            body,
+        )
+    } else {
+        let mut messages = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            messages.push(json!({"role": "system", "content": system_prompt}));
+        }
+        messages.push(json!({"role": "user", "content": user_prompt}));
+        let mut body = json!({
+            "model": model.clone(),
+            "max_tokens": max_tokens,
+            "stream": false,
+            "messages": messages
+        });
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature.clamp(0.0, 2.0));
+        }
+        (
+            proxy::openai_upstream_url(&provider.base_url, "/v1/chat/completions"),
+            body,
+        )
+    };
+
+    let mut req = state
+        .client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(120))
+        .json(&body);
+    if is_anthropic {
+        req = req
+            .header("x-api-key", provider.api_key)
+            .header("anthropic-version", "2023-06-01");
+    } else {
+        req = req.header("Authorization", format!("Bearer {}", provider.api_key));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|error| format!("Playground request failed: {}", error))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    let raw_body = serde_json::from_str::<Value>(&text)
+        .unwrap_or_else(|_| json!({"message": text, "parse_error": "Response was not JSON"}));
+    let success = (200..300).contains(&status);
+    if !success {
+        let detail = response_error_message(&raw_body).unwrap_or_else(|| raw_body.to_string());
+        return Err(format!("HTTP {}: {}", status, detail));
+    }
+
+    let usage = proxy::extract_token_usage(&raw_body);
+    let images = if mode == "image" {
+        extract_playground_images(&raw_body)
+    } else {
+        Vec::new()
+    };
+    let content = if mode == "image" {
+        if images.is_empty() {
+            String::new()
+        } else {
+            format!("Generated {} image(s).", images.len())
+        }
+    } else if is_anthropic {
+        anthropic_response_text(&raw_body)
+    } else {
+        openai_response_text(&raw_body)
+    };
+
+    Ok(PlaygroundResponse {
+        status,
+        success,
+        url,
+        provider_id: provider.id,
+        provider_name: provider.name,
+        protocol,
+        model,
+        content,
+        images,
+        usage,
+        raw_body,
+        latency_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 fn model_id_from_value(value: &Value) -> Option<String> {
     if let Some(model) = value.as_str() {
         return Some(model.to_string());
@@ -517,6 +821,48 @@ mod tests {
             extract_model_ids(&alternate_body),
             vec!["deepseek-chat", "deepseek-reasoner"]
         );
+    }
+
+    #[test]
+    fn playground_text_is_extracted_from_openai_and_anthropic_shapes() {
+        let openai_body = json!({
+            "choices": [
+                {"message": {"role": "assistant", "content": "openai answer"}}
+            ],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        });
+        assert_eq!(openai_response_text(&openai_body), "openai answer");
+        assert_eq!(proxy::extract_token_usage(&openai_body).input_tokens, 2);
+
+        let anthropic_body = json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 7}
+        });
+        assert_eq!(anthropic_response_text(&anthropic_body), "first\nsecond");
+        assert_eq!(proxy::extract_token_usage(&anthropic_body).output_tokens, 7);
+    }
+
+    #[test]
+    fn playground_images_are_extracted_from_openai_image_shapes() {
+        let body = json!({
+            "data": [
+                {"url": "https://example.com/image.png", "revised_prompt": "clean poster"},
+                {"b64_json": "abc", "mime_type": "image/png"}
+            ]
+        });
+
+        let images = extract_playground_images(&body);
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images[0].url.as_deref(),
+            Some("https://example.com/image.png")
+        );
+        assert_eq!(images[0].revised_prompt.as_deref(), Some("clean poster"));
+        assert_eq!(images[1].b64_json.as_deref(), Some("abc"));
+        assert_eq!(images[1].mime_type.as_deref(), Some("image/png"));
     }
 
     #[tokio::test]

@@ -81,6 +81,7 @@ fn main() {
             commands::stop_proxy,
             commands::test_provider,
             commands::fetch_provider_models,
+            commands::run_playground,
         ])
         .setup(move |app| {
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;

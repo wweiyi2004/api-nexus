@@ -70,7 +70,13 @@ test.beforeEach(async ({ page }) => {
     };
     Object.defineProperty(window, "__TEST_CONFIG__", { get: () => config });
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-      invoke: async (command: string, args?: { config?: typeof config }) => {
+      invoke: async (
+        command: string,
+        args?: {
+          config?: typeof config;
+          request?: { mode?: string };
+        },
+      ) => {
         if (command === "get_server_status") {
           return { running: false, port: 11434, host: "127.0.0.1", url: "http://127.0.0.1:11434" };
         }
@@ -111,6 +117,69 @@ test.beforeEach(async ({ page }) => {
             steps: [],
           };
         }
+        if (command === "run_playground") {
+          if (args?.request?.mode === "image") {
+            return {
+              status: 200,
+              success: true,
+              url: "https://a.example.com/v1/images/generations",
+              provider_id: "provider-a",
+              provider_name: "OpenAI Route",
+              protocol: "openai",
+              model: "shared-model",
+              content: "Generated 1 image(s).",
+              images: [
+                {
+                  url: null,
+                  b64_json:
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+                  mime_type: "image/png",
+                  revised_prompt: "mock image",
+                },
+              ],
+              usage: {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+              },
+              raw_body: {
+                data: [
+                  {
+                    b64_json:
+                      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+                    revised_prompt: "mock image",
+                  },
+                ],
+              },
+              latency_ms: 60,
+            };
+          }
+          return {
+            status: 200,
+            success: true,
+            url: "https://a.example.com/v1/chat/completions",
+            provider_id: "provider-a",
+            provider_name: "OpenAI Route",
+            protocol: "openai",
+            model: "shared-model",
+            content: "mock playground result",
+            images: [],
+            usage: {
+              input_tokens: 3,
+              output_tokens: 4,
+              cached_tokens: 0,
+              cache_read_tokens: 0,
+              cache_write_tokens: 0,
+            },
+            raw_body: {
+              choices: [{ message: { role: "assistant", content: "mock playground result" } }],
+              usage: { prompt_tokens: 3, completion_tokens: 4 },
+            },
+            latency_ms: 42,
+          };
+        }
         return null;
       },
     };
@@ -120,6 +189,14 @@ test.beforeEach(async ({ page }) => {
 test("navigates through dashboard, logs and settings", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "本地 API 网关" })).toBeVisible();
+
+  await page.getByRole("link", { name: "Playground" }).click();
+  await expect(page.getByRole("heading", { name: "Playground" })).toBeVisible();
+  await page.getByRole("button", { name: "运行" }).click();
+  await expect(page.getByTestId("playground-result-content")).toContainText("mock playground result");
+  await page.getByRole("button", { name: "生图" }).click();
+  await page.getByRole("button", { name: "运行" }).click();
+  await expect(page.getByTestId("playground-image-results").getByRole("img")).toBeVisible();
 
   await page.getByRole("link", { name: "请求日志" }).click();
   await expect(page.getByRole("heading", { name: "请求日志" })).toBeVisible();

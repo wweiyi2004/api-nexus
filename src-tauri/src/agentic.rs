@@ -313,6 +313,9 @@ pub async fn run_mixed_tool_loop(
         } else {
             openai_request_body(model, &messages, max_tokens, tools)
         };
+        if !anthropic && should_disable_thinking(provider, model) {
+            request_body["thinking"] = json!({"type": "disabled"});
+        }
         if !anthropic && !tools.is_empty() {
             request_body["parallel_tool_calls"] = Value::Bool(false);
         }
@@ -418,6 +421,20 @@ pub async fn run_mixed_tool_loop(
             messages.extend(openai_followup_messages(&assistant, &results));
         }
     }
+}
+
+fn should_disable_thinking(provider: &Provider, model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    if !model.starts_with("deepseek-v") {
+        return false;
+    }
+
+    provider.name.eq_ignore_ascii_case("deepseek")
+        || provider.id.eq_ignore_ascii_case("deepseek")
+        || provider
+            .base_url
+            .to_ascii_lowercase()
+            .contains("deepseek.com")
 }
 
 fn add_usage(total: &mut TokenUsage, round: TokenUsage) {
@@ -555,6 +572,7 @@ mod tests {
         let assistant = json!({
             "role": "assistant",
             "content": null,
+            "reasoning_content": "I should fetch the page.",
             "tool_calls": [{"id": "call_1", "type": "function", "function": {
                 "name": "web_fetch", "arguments": "{\"url\":\"https://e.com\"}"
             }}]
@@ -566,6 +584,7 @@ mod tests {
         };
         let messages = openai_followup_messages(&assistant, &[(call, "page".into())]);
         assert_eq!(messages[0], assistant);
+        assert_eq!(messages[0]["reasoning_content"], "I should fetch the page.");
         assert_eq!(
             messages[1],
             json!({
@@ -845,5 +864,41 @@ mod tests {
         .unwrap();
         assert_eq!(result.0, "direct");
         assert!(executor.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deepseek_v_models_disable_thinking_for_tool_loop() {
+        let (base_url, state) = spawn_model_server(vec![json!({
+            "choices": [{"message": {"role": "assistant", "content": "answer"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        })])
+        .await;
+        let executor = RecordingExecutor::default();
+        let result = run_tool_loop(
+            &reqwest::Client::new(),
+            &Provider {
+                id: "deepseek".into(),
+                name: "DeepSeek".into(),
+                protocol: "openai".into(),
+                base_url,
+                api_key: "secret".into(),
+                models: vec!["deepseek-v4-flash".into()],
+                enabled: true,
+                priority: 0,
+            },
+            "deepseek-v4-flash",
+            None,
+            vec![json!({"role": "user", "content": "question"})],
+            100,
+            &[fetch_spec()],
+            &executor,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.0, "answer");
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests[0]["thinking"], json!({"type": "disabled"}));
     }
 }
