@@ -57,6 +57,8 @@ test.beforeEach(async ({ page }) => {
         ],
         judge_model: { provider_id: "provider-a", model: "other-model" },
         final_model: null,
+        mode: "forced",
+        outer_model: null,
         max_panel_models: 4,
         timeout_secs: 120,
         web_search_daemon_url: null,

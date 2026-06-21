@@ -36,6 +36,8 @@ interface FusionConfig {
   panel_models: ModelRef[];
   judge_model: ModelRef | null;
   final_model: ModelRef | null;
+  mode: "forced" | "on_demand";
+  outer_model: ModelRef | null;
   max_panel_models: number;
   timeout_secs: number;
   web_search_daemon_url: string | null;
@@ -515,6 +517,43 @@ export default function Fusion() {
                     <option key={option.key} value={option.key}>{option.label}</option>
                   ))}
                 </select>
+              </label>
+            </div>
+
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <label className="space-y-1.5">
+                <span className="text-sm font-medium text-surface-700 dark:text-surface-300">代理模式</span>
+                <select
+                  className="input-field"
+                  value={config?.fusion.mode ?? "forced"}
+                  onChange={(event) => updateFusionConfig(
+                    "mode",
+                    event.target.value as FusionConfig["mode"],
+                  )}
+                >
+                  <option value="forced">始终运行 Fusion</option>
+                  <option value="on_demand">按需调用 Fusion</option>
+                </select>
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-sm font-medium text-surface-700 dark:text-surface-300">Outer Model</span>
+                <select
+                  className="input-field"
+                  value={modelRefKey(config?.fusion.outer_model)}
+                  disabled={(config?.fusion.mode ?? "forced") !== "on_demand"}
+                  onChange={(event) => updateFusionConfig(
+                    "outer_model",
+                    event.target.value ? modelRefFromKey(event.target.value) : null,
+                  )}
+                >
+                  <option value="">选择外层模型</option>
+                  {modelOptions.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  ))}
+                </select>
+                <span className="block text-xs text-surface-500 dark:text-surface-400">
+                  按需模式由外层模型决定是否调用 panel/judge，并负责最终回答。
+                </span>
               </label>
             </div>
 

@@ -1,4 +1,4 @@
-use crate::agentic::{self, ToolCall, ToolExecutor};
+use crate::agentic::{self, ToolCall, ToolExecutor, ToolSpec};
 use crate::config::{
     normalize_model_ref, normalize_model_refs, AppConfig, ModelPrice, ModelRef, Provider,
 };
@@ -82,6 +82,12 @@ pub struct FusionWorkbenchRequest {
 #[derive(Debug, Clone)]
 pub struct CompletedFusionRun {
     pub details: FusionRunDetails,
+    pub usage: TokenUsage,
+    pub final_content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedOnDemandRun {
     pub usage: TokenUsage,
     pub final_content: String,
 }
@@ -215,6 +221,7 @@ pub async fn run_workbench(
         messages,
         request.nexus_fusion,
         None,
+        true,
     )
     .await
 }
@@ -243,6 +250,7 @@ pub async fn run_from_openai_request(
         messages,
         overrides,
         final_max_tokens,
+        true,
     )
     .await
 }
@@ -273,8 +281,230 @@ pub async fn run_from_anthropic_request(
         messages,
         overrides,
         final_max_tokens,
+        true,
     )
     .await
+}
+
+pub async fn run_on_demand_from_openai_request(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    body: &Value,
+) -> Result<CompletedOnDemandRun, FusionError> {
+    reject_on_demand_request(body)?;
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| FusionError::bad_request("Fusion requires OpenAI chat messages"))?;
+    run_on_demand_with_messages(
+        client,
+        store,
+        config,
+        "openai",
+        messages,
+        fusion_overrides_from_body(body),
+        requested_max_tokens(body),
+        openai_requires_tool(body),
+    )
+    .await
+}
+
+pub async fn run_on_demand_from_anthropic_request(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    body: &Value,
+) -> Result<CompletedOnDemandRun, FusionError> {
+    reject_on_demand_request(body)?;
+    let openai_body =
+        proxy::anthropic_to_openai_chat_request(body).map_err(FusionError::bad_request)?;
+    let messages = openai_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| FusionError::bad_request("Fusion requires Anthropic messages"))?;
+    run_on_demand_with_messages(
+        client,
+        store,
+        config,
+        "anthropic",
+        messages,
+        fusion_overrides_from_body(body),
+        requested_max_tokens(body),
+        anthropic_requires_tool(body),
+    )
+    .await
+}
+
+fn reject_on_demand_request(body: &Value) -> Result<(), FusionError> {
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(FusionError::bad_request(
+            "Fusion does not support streaming yet",
+        ));
+    }
+    reject_non_text_body_content(body).map_err(FusionError::bad_request)
+}
+
+fn openai_requires_tool(body: &Value) -> bool {
+    match body.get("tool_choice") {
+        Some(Value::String(choice)) => choice.eq_ignore_ascii_case("required"),
+        Some(Value::Object(choice)) => choice
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| name == "fusion"),
+        _ => false,
+    }
+}
+
+fn anthropic_requires_tool(body: &Value) -> bool {
+    let Some(choice) = body.get("tool_choice") else {
+        return false;
+    };
+    matches!(choice.get("type").and_then(Value::as_str), Some("any"))
+        || (matches!(choice.get("type").and_then(Value::as_str), Some("tool"))
+            && choice.get("name").and_then(Value::as_str) == Some("fusion"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_on_demand_with_messages(
+    client: &Client,
+    store: &Arc<RequestLogStore>,
+    config: &AppConfig,
+    input_protocol: &str,
+    messages: Vec<Value>,
+    overrides: Option<FusionModelOverride>,
+    max_tokens: Option<u64>,
+    require_tool: bool,
+) -> Result<CompletedOnDemandRun, FusionError> {
+    if !config.fusion.enabled {
+        return Err(FusionError::bad_request("Fusion is disabled in settings"));
+    }
+    let outer_ref = config
+        .fusion
+        .outer_model
+        .clone()
+        .ok_or_else(|| FusionError::bad_request("Fusion outer model is not configured"))?;
+    if is_fusion_model(&outer_ref.model) {
+        return Err(FusionError::bad_request(
+            "Fusion outer model cannot be nexus/fusion",
+        ));
+    }
+    let outer = resolve_model_ref(config, outer_ref).map_err(FusionError::bad_request)?;
+    reject_non_text_messages(&messages).map_err(FusionError::bad_request)?;
+
+    let outer_messages = with_system_message(
+        &messages,
+        "You are the outer model for API Nexus Fusion. Answer the user directly. Call the fusion tool when independent panel analysis would materially improve correctness, breadth, or confidence. If you call it, use its analysis as evidence and then write the final answer yourself. Do not mention hidden orchestration.",
+    );
+    let executor = FusionToolExecutor {
+        client: client.clone(),
+        store: store.clone(),
+        config: config.clone(),
+        input_protocol: input_protocol.to_string(),
+        messages,
+        overrides,
+        usage: tokio::sync::Mutex::new(TokenUsage::default()),
+    };
+    let spec = fusion_tool_spec();
+    let max_tokens = max_tokens.unwrap_or(DEFAULT_STAGE_MAX_TOKENS);
+    let (system, protocol_messages) = messages_for_provider(&outer, outer_messages, max_tokens)
+        .map_err(FusionError::bad_request)?;
+    let (final_content, mut usage) = agentic::run_tool_loop_with_required_tool(
+        client,
+        &outer.provider,
+        &outer.model_ref.model,
+        system.as_deref(),
+        protocol_messages,
+        max_tokens,
+        &[spec],
+        &executor,
+        1,
+        require_tool,
+    )
+    .await
+    .map_err(FusionError::upstream)?;
+    add_token_usage(&mut usage, *executor.usage.lock().await);
+    Ok(CompletedOnDemandRun {
+        usage,
+        final_content,
+    })
+}
+
+fn fusion_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "fusion".into(),
+        description: "Run multiple independent models and a judge to analyze the user's request."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "focus": {"type": "string", "description": "Optional analysis focus"}
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+struct FusionToolExecutor {
+    client: Client,
+    store: Arc<RequestLogStore>,
+    config: AppConfig,
+    input_protocol: String,
+    messages: Vec<Value>,
+    overrides: Option<FusionModelOverride>,
+    usage: tokio::sync::Mutex<TokenUsage>,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for FusionToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<String, String> {
+        if call.name != "fusion" {
+            return Err(format!("Unknown server tool: {}", call.name));
+        }
+        let mut messages = self.messages.clone();
+        if let Some(focus) = call
+            .arguments
+            .get("focus")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|focus| !focus.is_empty())
+        {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("Additional analysis focus requested by the outer model: {focus}")
+            }));
+        }
+        let run = run_with_messages(
+            &self.client,
+            &self.store,
+            &self.config,
+            self.input_protocol.clone(),
+            None,
+            messages,
+            self.overrides.clone(),
+            None,
+            false,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        add_token_usage(&mut *self.usage.lock().await, run.usage);
+        Ok(run.final_content)
+    }
+}
+
+fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cached_tokens = total.cached_tokens.saturating_add(usage.cached_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(usage.cache_read_tokens);
+    total.cache_write_tokens = total
+        .cache_write_tokens
+        .saturating_add(usage.cache_write_tokens);
 }
 
 fn reject_unsupported_request(body: &Value) -> Result<(), FusionError> {
@@ -347,6 +577,7 @@ async fn run_with_messages(
     messages: Vec<Value>,
     overrides: Option<FusionModelOverride>,
     final_max_tokens: Option<u64>,
+    include_final: bool,
 ) -> Result<CompletedFusionRun, FusionError> {
     let resolved = resolve_fusion_models(config, overrides).map_err(FusionError::bad_request)?;
     reject_non_text_messages(&messages).map_err(FusionError::bad_request)?;
@@ -366,6 +597,7 @@ async fn run_with_messages(
         &messages,
         final_max_tokens.unwrap_or(DEFAULT_STAGE_MAX_TOKENS),
         &mut totals,
+        include_final,
     )
     .await;
 
@@ -429,6 +661,7 @@ async fn execute_fusion(
     messages: &[Value],
     final_max_tokens: u64,
     totals: &mut RunTotals,
+    include_final: bool,
 ) -> Result<String, String> {
     let web_tools = if config.fusion.enable_web_tools {
         config
@@ -533,6 +766,10 @@ async fn execute_fusion(
                     .unwrap_or_else(|| "empty judge response".to_string())
             )
         })?;
+
+    if !include_final {
+        return Ok(judge_content);
+    }
 
     let final_messages = vec![
         json!({
@@ -669,7 +906,28 @@ async fn call_model_inner(
         .unwrap_or(&NO_TOOLS_EXECUTOR);
     let effective_max_tool_calls = if tools.is_empty() { 0 } else { max_tool_calls };
 
-    let (system, messages) = if proxy::is_anthropic_provider(&target.provider) {
+    let (system, messages) = messages_for_provider(target, messages, max_tokens)?;
+
+    agentic::run_tool_loop(
+        client,
+        &target.provider,
+        &target.model_ref.model,
+        system.as_deref(),
+        messages,
+        max_tokens,
+        &tools,
+        executor,
+        effective_max_tool_calls,
+    )
+    .await
+}
+
+fn messages_for_provider(
+    target: &ResolvedModel,
+    messages: Vec<Value>,
+    max_tokens: u64,
+) -> Result<(Option<String>, Vec<Value>), String> {
+    if proxy::is_anthropic_provider(&target.provider) {
         let openai_body = json!({
             "model": target.model_ref.model,
             "messages": messages,
@@ -686,23 +944,10 @@ async fn call_model_inner(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        (system, messages)
+        Ok((system, messages))
     } else {
-        (None, messages)
-    };
-
-    agentic::run_tool_loop(
-        client,
-        &target.provider,
-        &target.model_ref.model,
-        system.as_deref(),
-        messages,
-        max_tokens,
-        &tools,
-        executor,
-        effective_max_tool_calls,
-    )
-    .await
+        Ok((None, messages))
+    }
 }
 
 struct NoToolsExecutor;
@@ -1072,6 +1317,24 @@ mod tests {
             let error = reject_unsupported_request(&body).unwrap_err();
             assert!(error.to_string().contains("tool calling"));
         }
+    }
+
+    #[test]
+    fn on_demand_recognizes_required_tool_choices() {
+        assert!(openai_requires_tool(&json!({"tool_choice": "required"})));
+        assert!(openai_requires_tool(&json!({
+            "tool_choice": {"type": "function", "function": {"name": "fusion"}}
+        })));
+        assert!(!openai_requires_tool(&json!({"tool_choice": "auto"})));
+        assert!(anthropic_requires_tool(
+            &json!({"tool_choice": {"type": "any"}})
+        ));
+        assert!(anthropic_requires_tool(&json!({
+            "tool_choice": {"type": "tool", "name": "fusion"}
+        })));
+        assert!(!anthropic_requires_tool(
+            &json!({"tool_choice": {"type": "auto"}})
+        ));
     }
 
     #[test]

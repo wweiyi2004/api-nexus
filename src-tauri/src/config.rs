@@ -52,6 +52,10 @@ pub struct FusionConfig {
     pub judge_model: Option<ModelRef>,
     #[serde(default)]
     pub final_model: Option<ModelRef>,
+    #[serde(default = "default_fusion_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub outer_model: Option<ModelRef>,
     #[serde(default = "default_fusion_max_panel_models")]
     pub max_panel_models: u8,
     #[serde(default = "default_fusion_timeout_secs")]
@@ -168,6 +172,10 @@ fn default_max_log_entries() -> usize {
 
 fn default_fusion_enabled() -> bool {
     true
+}
+
+fn default_fusion_mode() -> String {
+    "forced".to_string()
 }
 
 fn default_fusion_max_panel_models() -> u8 {
@@ -638,6 +646,8 @@ impl Default for FusionConfig {
             panel_models: Vec::new(),
             judge_model: None,
             final_model: None,
+            mode: default_fusion_mode(),
+            outer_model: None,
             max_panel_models: default_fusion_max_panel_models(),
             timeout_secs: default_fusion_timeout_secs(),
             web_search_daemon_url: None,
@@ -751,6 +761,12 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     config.fusion.panel_models = normalize_model_refs(config.fusion.panel_models);
     config.fusion.judge_model = normalize_optional_model_ref(config.fusion.judge_model);
     config.fusion.final_model = normalize_optional_model_ref(config.fusion.final_model);
+    config.fusion.outer_model = normalize_optional_model_ref(config.fusion.outer_model);
+    config.fusion.mode = if config.fusion.mode.eq_ignore_ascii_case("on_demand") {
+        "on_demand".to_string()
+    } else {
+        "forced".to_string()
+    };
 
     for price in &mut config.model_prices {
         if price.cache_read_usd_per_million <= 0.0 && price.cached_usd_per_million > 0.0 {
@@ -1148,17 +1164,21 @@ mod tests {
     fn fusion_web_tool_defaults_and_limits_are_normalized() {
         let defaults = FusionConfig::default();
         assert!(!defaults.enable_web_tools);
+        assert_eq!(defaults.mode, "forced");
+        assert!(defaults.outer_model.is_none());
         assert_eq!(defaults.max_tool_calls, 8);
         assert_eq!(defaults.web_search_limit, 5);
         assert_eq!(defaults.web_fetch_max_chars, 30_000);
 
         let mut config = AppConfig::default();
+        config.fusion.mode = "ON_DEMAND".into();
         config.fusion.max_tool_calls = 99;
         config.fusion.web_search_limit = 99;
         config.fusion.web_fetch_max_chars = 999_999;
         config.fusion.web_search_daemon_url = Some("  http://127.0.0.1:3210/  ".into());
         let config = normalize_config(config);
         assert_eq!(config.fusion.max_tool_calls, 16);
+        assert_eq!(config.fusion.mode, "on_demand");
         assert_eq!(config.fusion.web_search_limit, 50);
         assert_eq!(config.fusion.web_fetch_max_chars, 200_000);
         assert_eq!(

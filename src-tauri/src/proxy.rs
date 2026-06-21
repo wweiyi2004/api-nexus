@@ -1896,19 +1896,28 @@ async fn try_fusion(state: &ProxyState, dialect: ApiDialect, prepared: &Prepared
     }
 
     let config = state.config.read().await.clone();
-    let run_result = match dialect {
-        ApiDialect::OpenAI => {
-            fusion::run_from_openai_request(
+    let run_result = if config.fusion.mode == "on_demand" {
+        match dialect {
+            ApiDialect::OpenAI => fusion::run_on_demand_from_openai_request(
                 &state.client,
                 &state.request_logs,
                 &config,
                 &prepared.body_json,
-                None,
             )
             .await
+            .map(|run| (run.final_content, run.usage)),
+            ApiDialect::Anthropic => fusion::run_on_demand_from_anthropic_request(
+                &state.client,
+                &state.request_logs,
+                &config,
+                &prepared.body_json,
+            )
+            .await
+            .map(|run| (run.final_content, run.usage)),
         }
-        ApiDialect::Anthropic => {
-            fusion::run_from_anthropic_request(
+    } else {
+        match dialect {
+            ApiDialect::OpenAI => fusion::run_from_openai_request(
                 &state.client,
                 &state.request_logs,
                 &config,
@@ -1916,17 +1925,27 @@ async fn try_fusion(state: &ProxyState, dialect: ApiDialect, prepared: &Prepared
                 None,
             )
             .await
+            .map(|run| (run.final_content, run.usage)),
+            ApiDialect::Anthropic => fusion::run_from_anthropic_request(
+                &state.client,
+                &state.request_logs,
+                &config,
+                &prepared.body_json,
+                None,
+            )
+            .await
+            .map(|run| (run.final_content, run.usage)),
         }
     };
 
     match run_result {
-        Ok(run) => {
-            record_token_usage(&state.token_stats, run.usage).await;
-            log_request_with_body(&state.request_logs, &fusion_log(200), run.usage, None).await;
+        Ok((final_content, usage)) => {
+            record_token_usage(&state.token_stats, usage).await;
+            log_request_with_body(&state.request_logs, &fusion_log(200), usage, None).await;
             let body = match dialect {
-                ApiDialect::OpenAI => fusion::openai_chat_response(&run.final_content, run.usage),
+                ApiDialect::OpenAI => fusion::openai_chat_response(&final_content, usage),
                 ApiDialect::Anthropic => {
-                    fusion::anthropic_message_response(&run.final_content, run.usage)
+                    fusion::anthropic_message_response(&final_content, usage)
                 }
             };
             Some(Json(body).into_response())
@@ -2480,6 +2499,14 @@ mod tests {
         }
     }
 
+    fn on_demand_fusion_config() -> FusionConfig {
+        FusionConfig {
+            mode: "on_demand".to_string(),
+            outer_model: Some(fusion_model_ref("outer")),
+            ..fusion_config()
+        }
+    }
+
     #[test]
     fn replay_request_body_only_keeps_small_replayable_requests() {
         assert!(replay_request_body(
@@ -2920,6 +2947,148 @@ mod tests {
             .unwrap_or_default()
             .contains("\"nexus/fusion\""));
 
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn on_demand_outer_model_can_decline_fusion() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default();
+                Json(json!({
+                    "choices": [{"message": {"role": "assistant", "content": format!("direct from {model}")}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+                }))
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let store = Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap());
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(), "panel-b".to_string(), "judge".to_string(),
+                    "final".to_string(), "outer".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: on_demand_fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(TokenStats::default())),
+            store.clone(),
+        );
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "messages": [{"role": "user", "content": "simple question"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "direct from outer");
+        assert!(store.list_fusion_runs().await.unwrap().is_empty());
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn on_demand_required_tool_runs_fusion_then_outer_synthesis() {
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_handler = captured_requests.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    let model = body["model"].as_str().unwrap_or_default();
+                    let has_tool_result = body["messages"]
+                        .as_array()
+                        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+                    let message = if model == "outer" && !has_tool_result {
+                        json!({"role": "assistant", "content": null, "tool_calls": [{
+                            "id": "fusion_1", "type": "function", "function": {
+                                "name": "fusion", "arguments": "{\"focus\":\"verify carefully\"}"
+                            }
+                        }]})
+                    } else if model == "outer" {
+                        json!({"role": "assistant", "content": "outer synthesized answer"})
+                    } else {
+                        json!({"role": "assistant", "content": format!("analysis from {model}")})
+                    };
+                    Json(json!({
+                        "choices": [{"message": message}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_task) = spawn_router(upstream).await;
+        let store = Arc::new(RequestLogStore::open_in_memory(1000, 30).unwrap());
+        let config = AppConfig {
+            providers: vec![Provider {
+                id: "fusion-provider".to_string(),
+                models: vec![
+                    "panel-a".to_string(), "panel-b".to_string(), "judge".to_string(),
+                    "final".to_string(), "outer".to_string(),
+                ],
+                ..provider(format!("http://{}", upstream_addr), 0)
+            }],
+            fusion: on_demand_fusion_config(),
+            ..Default::default()
+        };
+        let proxy = create_proxy_router_with_stats(
+            Arc::new(RwLock::new(config)),
+            Arc::new(RwLock::new(TokenStats::default())),
+            store.clone(),
+        );
+        let (proxy_addr, proxy_task) = spawn_router(proxy).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "nexus/fusion",
+                "tool_choice": "required",
+                "messages": [{"role": "user", "content": "complex question"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "outer synthesized answer");
+        {
+            let requests = captured_requests.lock().unwrap();
+            let first_outer = requests
+                .iter()
+                .find(|request| request["model"] == "outer")
+                .unwrap();
+            assert_eq!(first_outer["tool_choice"], "required");
+            assert!(requests
+                .iter()
+                .filter(|request| request["model"] != "outer")
+                .all(|request| request.get("tools").is_none()));
+            assert!(!requests.iter().any(|request| request["model"] == "final"));
+        }
+        let runs = store.list_fusion_runs().await.unwrap();
+        assert_eq!(runs.len(), 1);
+        let details = store.get_fusion_run(runs[0].id).await.unwrap().unwrap();
+        assert_eq!(
+            details.steps.iter().map(|step| step.role.as_str()).collect::<Vec<_>>(),
+            ["panel", "panel", "judge"]
+        );
         upstream_task.abort();
         proxy_task.abort();
     }

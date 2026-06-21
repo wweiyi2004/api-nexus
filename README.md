@@ -76,6 +76,8 @@ npx open-websearch serve
 
 In the Fusion page, enable web tools and enter the loopback daemon URL printed by that command (for example, `http://127.0.0.1:3210`). API Nexus accepts only `localhost`, `127.0.0.1`, or `::1` daemon hosts. When web tools are disabled or no daemon URL is configured, Fusion uses its original single-request model calls.
 
+Fusion proxy routing supports two modes. `forced` always runs panel, judge, and final stages. `on_demand` sends the request to the configured outer model with a server-side `fusion` tool; the outer model can answer directly or invoke panel/judge analysis and then write the final response. Clients can force that invocation with OpenAI `tool_choice: "required"` or Anthropic `tool_choice: {"type":"any"}`. Streaming remains unsupported for both modes.
+
 ## Release Automation
 
 GitHub Actions verifies frontend tests, Playwright smoke tests, Rust tests, formatting, and Clippy on every change. Tags matching `v*` trigger the release workflow, which builds installers, emits signed updater artifacts, uploads `latest.json`, and publishes the GitHub Release.

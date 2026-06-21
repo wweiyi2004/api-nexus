@@ -217,11 +217,40 @@ pub async fn run_tool_loop(
     provider: &Provider,
     model: &str,
     system: Option<&str>,
+    messages: Vec<Value>,
+    max_tokens: u64,
+    tools: &[ToolSpec],
+    executor: &dyn ToolExecutor,
+    max_tool_calls: u32,
+) -> Result<(String, TokenUsage), String> {
+    run_tool_loop_with_required_tool(
+        client,
+        provider,
+        model,
+        system,
+        messages,
+        max_tokens,
+        tools,
+        executor,
+        max_tool_calls,
+        false,
+    )
+    .await
+}
+
+/// Variant used by on-demand Fusion when the caller requires a server tool.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_loop_with_required_tool(
+    client: &reqwest::Client,
+    provider: &Provider,
+    model: &str,
+    system: Option<&str>,
     mut messages: Vec<Value>,
     max_tokens: u64,
     tools: &[ToolSpec],
     executor: &dyn ToolExecutor,
     max_tool_calls: u32,
+    require_tool: bool,
 ) -> Result<(String, TokenUsage), String> {
     let anthropic = proxy::is_anthropic_provider(provider);
     let mut usage = TokenUsage::default();
@@ -229,11 +258,18 @@ pub async fn run_tool_loop(
     let mut best_text = None;
 
     loop {
-        let request_body = if anthropic {
+        let mut request_body = if anthropic {
             anthropic_request_body(model, system, &messages, max_tokens, tools)
         } else {
             openai_request_body(model, &messages, max_tokens, tools)
         };
+        if require_tool && executed_calls == 0 && !tools.is_empty() {
+            request_body["tool_choice"] = if anthropic {
+                json!({"type": "any"})
+            } else {
+                Value::String("required".to_string())
+            };
+        }
         let url = if anthropic {
             proxy::anthropic_upstream_url(&provider.base_url, "/v1/messages")
         } else {
