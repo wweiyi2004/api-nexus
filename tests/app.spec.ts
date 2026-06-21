@@ -59,6 +59,11 @@ test.beforeEach(async ({ page }) => {
         final_model: null,
         max_panel_models: 4,
         timeout_secs: 120,
+        web_search_daemon_url: null,
+        enable_web_tools: false,
+        max_tool_calls: 8,
+        web_search_limit: 5,
+        web_fetch_max_chars: 30000,
       },
     };
     Object.defineProperty(window, "__TEST_CONFIG__", { get: () => config });
@@ -120,6 +125,10 @@ test("navigates through dashboard, logs and settings", async ({ page }) => {
 
   await page.getByRole("link", { name: "Fusion" }).click();
   await expect(page.getByRole("heading", { name: "Fusion" })).toBeVisible();
+  await page.getByRole("checkbox", { name: "启用网页工具" }).check();
+  await page.getByLabel("Daemon URL").fill("http://127.0.0.1:3210");
+  await page.getByRole("button", { name: "保存默认" }).click();
+  await expect(page.getByText("Fusion 默认配置已保存")).toBeVisible();
 
   await page.getByRole("link", { name: "设置" }).click();
   await expect(page.getByRole("heading", { name: "设置" })).toBeVisible();

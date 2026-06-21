@@ -13,6 +13,7 @@ API Nexus is a local API gateway for routing AI model requests through OpenAI-co
 - Persistent SQLite request logs with retention controls and CSV export
 - Responsive line-chart usage trends and compact expandable request logs
 - Provider-specific model pricing with verified preset prices, cache pricing, and USD/CNY cost estimates
+- Fusion panel/judge/final routing with optional local web search and page fetching
 - Windows DPAPI protection for upstream and client API keys
 - Signed in-app updates from GitHub Releases
 - Local proxy API key protection and background system-tray operation
@@ -64,6 +65,16 @@ API Nexus stores local state under `%APPDATA%\api-nexus`:
 - `api-nexus.sqlite3`: persistent request logs and usage history
 
 The retention period and maximum number of log entries are configurable in Settings. Logs can be exported as CSV from the Request Log page.
+
+## Fusion Web Tools
+
+Fusion panel and judge models can use `web_search` and `web_fetch` through a local [open-webSearch](https://www.npmjs.com/package/open-websearch) daemon. Start the daemon separately:
+
+```bash
+npx open-websearch serve
+```
+
+In the Fusion page, enable web tools and enter the loopback daemon URL printed by that command (for example, `http://127.0.0.1:3210`). API Nexus accepts only `localhost`, `127.0.0.1`, or `::1` daemon hosts. When web tools are disabled or no daemon URL is configured, Fusion uses its original single-request model calls.
 
 ## Release Automation
 

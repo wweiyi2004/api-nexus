@@ -38,6 +38,11 @@ interface FusionConfig {
   final_model: ModelRef | null;
   max_panel_models: number;
   timeout_secs: number;
+  web_search_daemon_url: string | null;
+  enable_web_tools: boolean;
+  max_tool_calls: number;
+  web_search_limit: number;
+  web_fetch_max_chars: number;
 }
 
 interface AppConfig {
@@ -281,6 +286,16 @@ export default function Fusion() {
     setPanelModels(panelModels.filter((_, itemIndex) => itemIndex !== index));
   };
 
+  const updateFusionConfig = <Key extends keyof FusionConfig>(
+    key: Key,
+    value: FusionConfig[Key],
+  ) => {
+    setConfig((current) => current ? {
+      ...current,
+      fusion: { ...current.fusion, [key]: value },
+    } : current);
+  };
+
   const parseMessages = () => {
     if (!messagesJson.trim()) return [];
     const parsed = JSON.parse(messagesJson);
@@ -335,7 +350,7 @@ export default function Fusion() {
       };
       const saved = await invoke<AppConfig>("save_config_cmd", { config: nextConfig });
       setConfig(saved);
-      setNotice("Fusion 默认模型已保存");
+      setNotice("Fusion 默认配置已保存");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -501,6 +516,89 @@ export default function Fusion() {
                   ))}
                 </select>
               </label>
+            </div>
+
+            <div className="mt-4 border-t border-surface-200 pt-4 dark:border-surface-800">
+              <label className="flex items-start gap-3">
+                <input
+                  type="checkbox"
+                  className="mt-1 h-4 w-4 rounded border-surface-300"
+                  checked={config?.fusion.enable_web_tools ?? false}
+                  onChange={(event) => updateFusionConfig("enable_web_tools", event.target.checked)}
+                />
+                <span>
+                  <span className="block text-sm font-medium text-surface-700 dark:text-surface-300">
+                    启用网页工具
+                  </span>
+                  <span className="mt-0.5 block text-xs text-surface-500 dark:text-surface-400">
+                    Panel 和 Judge 可调用本机 open-webSearch 的 web_search / web_fetch。
+                  </span>
+                </span>
+              </label>
+
+              <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                <label className="space-y-1.5 md:col-span-2">
+                  <span className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                    Daemon URL
+                  </span>
+                  <input
+                    className="input-field font-mono text-xs"
+                    value={config?.fusion.web_search_daemon_url ?? ""}
+                    placeholder="http://127.0.0.1:3210"
+                    disabled={!config?.fusion.enable_web_tools}
+                    onChange={(event) => updateFusionConfig(
+                      "web_search_daemon_url",
+                      event.target.value || null,
+                    )}
+                  />
+                  <span className="block text-xs text-surface-500 dark:text-surface-400">
+                    先运行 npx open-websearch serve；仅接受 localhost、127.0.0.1 或 ::1。
+                  </span>
+                </label>
+                <label className="space-y-1.5">
+                  <span className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                    最大工具调用
+                  </span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={16}
+                    className="input-field"
+                    value={config?.fusion.max_tool_calls ?? 8}
+                    disabled={!config?.fusion.enable_web_tools}
+                    onChange={(event) => updateFusionConfig("max_tool_calls", Number(event.target.value))}
+                  />
+                </label>
+                <label className="space-y-1.5">
+                  <span className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                    搜索结果数
+                  </span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    className="input-field"
+                    value={config?.fusion.web_search_limit ?? 5}
+                    disabled={!config?.fusion.enable_web_tools}
+                    onChange={(event) => updateFusionConfig("web_search_limit", Number(event.target.value))}
+                  />
+                </label>
+                <label className="space-y-1.5 md:col-span-2">
+                  <span className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                    单页最大字符数
+                  </span>
+                  <input
+                    type="number"
+                    min={1000}
+                    max={200000}
+                    step={1000}
+                    className="input-field"
+                    value={config?.fusion.web_fetch_max_chars ?? 30000}
+                    disabled={!config?.fusion.enable_web_tools}
+                    onChange={(event) => updateFusionConfig("web_fetch_max_chars", Number(event.target.value))}
+                  />
+                </label>
+              </div>
             </div>
           </section>
 
