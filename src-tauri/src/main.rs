@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 fn main() {
     env_logger::init();
 
-    let app_config = config::load_config();
+    let (app_config, config_persistence_enabled) = config::load_config();
     let auto_start = app_config.auto_start;
     let request_logs = Arc::new(
         storage::RequestLogStore::open(
@@ -38,6 +38,7 @@ fn main() {
 
     let state = Arc::new(AppState {
         config: Arc::new(RwLock::new(app_config)),
+        config_persistence_enabled,
         client: Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(60))

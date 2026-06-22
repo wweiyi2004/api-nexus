@@ -79,6 +79,12 @@ function generateProxyKey() {
   return `sk-nexus-${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
+function proxyBaseUrl(host: string, port: number) {
+  const normalizedHost = host.trim().replace(/^\[(.*)\]$/, "$1");
+  const urlHost = normalizedHost.includes(":") ? `[${normalizedHost}]` : normalizedHost;
+  return `http://${urlHost}:${port}`;
+}
+
 export default function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [saved, setSaved] = useState(false);
@@ -104,7 +110,7 @@ export default function Settings() {
 
   const baseUrl = useMemo(() => {
     if (!config) return "";
-    return `http://${config.proxy_host}:${config.proxy_port}`;
+    return proxyBaseUrl(config.proxy_host, config.proxy_port);
   }, [config]);
 
   const handleSave = async () => {

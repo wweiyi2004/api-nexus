@@ -713,6 +713,19 @@ pub fn generate_proxy_api_key() -> String {
 }
 
 pub fn normalize_config(mut config: AppConfig) -> AppConfig {
+    config.proxy_host = config
+        .proxy_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    if config.proxy_host.is_empty() {
+        config.proxy_host = default_proxy_host();
+    }
+    if config.proxy_port == 0 {
+        config.proxy_port = default_proxy_port();
+    }
+
     let mut provider_ids = HashSet::new();
     for provider in &mut config.providers {
         if provider.id.trim().is_empty() || !provider_ids.insert(provider.id.clone()) {
@@ -762,6 +775,28 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     config.fusion.judge_model = normalize_optional_model_ref(config.fusion.judge_model);
     config.fusion.final_model = normalize_optional_model_ref(config.fusion.final_model);
     config.fusion.outer_model = normalize_optional_model_ref(config.fusion.outer_model);
+    let valid_model_refs: HashSet<(String, String)> = config
+        .providers
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .models
+                .iter()
+                .map(|model| (provider.id.clone(), model.clone()))
+        })
+        .collect();
+    config.fusion.panel_models.retain(|model_ref| {
+        valid_model_refs.contains(&(model_ref.provider_id.clone(), model_ref.model.clone()))
+    });
+    config.fusion.judge_model = config.fusion.judge_model.filter(|model_ref| {
+        valid_model_refs.contains(&(model_ref.provider_id.clone(), model_ref.model.clone()))
+    });
+    config.fusion.final_model = config.fusion.final_model.filter(|model_ref| {
+        valid_model_refs.contains(&(model_ref.provider_id.clone(), model_ref.model.clone()))
+    });
+    config.fusion.outer_model = config.fusion.outer_model.filter(|model_ref| {
+        valid_model_refs.contains(&(model_ref.provider_id.clone(), model_ref.model.clone()))
+    });
     config.fusion.mode = if config.fusion.mode.eq_ignore_ascii_case("on_demand") {
         "on_demand".to_string()
     } else {
@@ -891,36 +926,51 @@ pub(crate) fn normalize_model_refs(model_refs: Vec<ModelRef>) -> Vec<ModelRef> {
         .collect()
 }
 
-fn read_config_or_default() -> AppConfig {
+fn read_config_or_default() -> (AppConfig, bool) {
     let path = config_path();
     if !path.exists() {
-        return AppConfig::default();
+        // A secrets file without its matching config cannot be safely
+        // regenerated because its entries are keyed by IDs from config.json.
+        return (AppConfig::default(), !secrets_path().exists());
     }
 
     match fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str(&content) {
-            Ok(config) => config,
+            Ok(config) => (config, true),
             Err(err) => {
                 log::error!("Failed to parse config {:?}: {}", path, err);
                 backup_invalid_config(&path);
-                AppConfig::default()
+                (AppConfig::default(), false)
             }
         },
         Err(err) => {
             log::error!("Failed to read config {:?}: {}", path, err);
-            AppConfig::default()
+            (AppConfig::default(), false)
         }
     }
 }
 
-pub fn load_config() -> AppConfig {
-    let mut config = read_config_or_default();
-    if let Err(error) = crate::security::hydrate_config_secrets(&mut config, &secrets_path()) {
-        log::error!("Failed to load secure API keys: {}", error);
-    }
+pub fn load_config() -> (AppConfig, bool) {
+    let (mut config, config_can_be_persisted) = read_config_or_default();
+    let secrets_loaded = match crate::security::hydrate_config_secrets(&mut config, &secrets_path())
+    {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("Failed to load secure API keys: {}", error);
+            false
+        }
+    };
     let config = normalize_config(config);
-    save_config(&config).ok();
-    config
+    if config_can_be_persisted && secrets_loaded {
+        if let Err(error) = save_config(&config) {
+            log::error!("Failed to persist normalized config: {}", error);
+        }
+    } else {
+        log::error!(
+            "Skipped automatic config persistence to avoid overwriting unrecovered secrets"
+        );
+    }
+    (config, config_can_be_persisted && secrets_loaded)
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
@@ -1194,5 +1244,43 @@ mod tests {
         assert_eq!(zeroes.fusion.max_tool_calls, 8);
         assert_eq!(zeroes.fusion.web_search_limit, 5);
         assert_eq!(zeroes.fusion.web_fetch_max_chars, 30_000);
+    }
+
+    #[test]
+    fn proxy_endpoint_and_stale_fusion_refs_are_normalized() {
+        let valid_ref = ModelRef {
+            provider_id: "provider".into(),
+            model: "model-a".into(),
+        };
+        let stale_ref = ModelRef {
+            provider_id: "removed".into(),
+            model: "model-b".into(),
+        };
+        let mut config = AppConfig {
+            proxy_host: " [::1] ".into(),
+            proxy_port: 0,
+            providers: vec![Provider {
+                id: "provider".into(),
+                models: vec!["model-a".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.fusion.panel_models = vec![valid_ref.clone(), stale_ref.clone()];
+        config.fusion.judge_model = Some(stale_ref.clone());
+        config.fusion.final_model = Some(valid_ref.clone());
+        config.fusion.outer_model = Some(stale_ref);
+
+        let config = normalize_config(config);
+
+        assert_eq!(config.proxy_host, "::1");
+        assert_eq!(config.proxy_port, 11434);
+        assert_eq!(
+            config.fusion.panel_models.as_slice(),
+            std::slice::from_ref(&valid_ref)
+        );
+        assert!(config.fusion.judge_model.is_none());
+        assert_eq!(config.fusion.final_model, Some(valid_ref));
+        assert!(config.fusion.outer_model.is_none());
     }
 }

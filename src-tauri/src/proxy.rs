@@ -667,7 +667,7 @@ async fn passthrough_response(
 
     let stream = async_stream::stream! {
         let mut upstream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut usage = TokenUsage::default();
         let mut accumulated = Vec::new();
 
@@ -675,10 +675,8 @@ async fn passthrough_response(
             match chunk {
                 Ok(bytes) => {
                     if is_stream {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let frame = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                        buffer.extend_from_slice(&bytes);
+                        while let Some(frame) = take_sse_frame(&mut buffer) {
                             usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
                         }
                     } else {
@@ -695,8 +693,9 @@ async fn passthrough_response(
         }
 
         if is_stream {
-            if !buffer.trim().is_empty() {
-                usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
+            if !buffer.iter().all(u8::is_ascii_whitespace) {
+                let frame = String::from_utf8_lossy(&buffer);
+                usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
             }
             record_token_usage(&token_stats, usage).await;
             log_request_with_body(&request_logs, &log_context, usage, None).await;
@@ -1390,6 +1389,36 @@ fn parse_sse_frame(frame: &str) -> (Option<String>, Option<String>) {
     (event, data)
 }
 
+/// Removes and decodes one complete SSE frame. Network chunks may split a
+/// UTF-8 code point, so decoding must happen only after a frame delimiter has
+/// been found in the accumulated byte buffer.
+fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
+    fn end_of_line(bytes: &[u8]) -> Option<usize> {
+        if bytes.starts_with(b"\r\n") {
+            Some(2)
+        } else if bytes.starts_with(b"\r") || bytes.starts_with(b"\n") {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    let mut delimiter = None;
+    for index in 0..buffer.len() {
+        if let Some(first_len) = end_of_line(&buffer[index..]) {
+            if let Some(second_len) = end_of_line(&buffer[index + first_len..]) {
+                delimiter = Some((index, first_len + second_len));
+                break;
+            }
+        }
+    }
+
+    let (frame_end, delimiter_len) = delimiter?;
+    let frame = buffer.drain(..frame_end).collect::<Vec<_>>();
+    buffer.drain(..delimiter_len);
+    Some(String::from_utf8_lossy(&frame).into_owned())
+}
+
 fn openai_stream_chunk(id: &str, model: &str, delta: Value, finish_reason: Value) -> String {
     format!(
         "data: {}\n\n",
@@ -1428,7 +1457,7 @@ async fn openai_stream_to_anthropic_response(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let stream = async_stream::stream! {
         let mut upstream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut usage = TokenUsage::default();
         let mut response_id = format!("msg_openai_{}", unix_timestamp());
         let mut sent_start = false;
@@ -1442,10 +1471,8 @@ async fn openai_stream_to_anthropic_response(
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let frame = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
+                    buffer.extend_from_slice(&bytes);
+                    while let Some(frame) = take_sse_frame(&mut buffer) {
                         let (_, data) = parse_sse_frame(&frame);
                         let Some(data) = data else {
                             continue;
@@ -1636,6 +1663,8 @@ fn anthropic_frame_to_openai_chunks(
     frame: &str,
     response_id: &mut String,
     model: &str,
+    tool_indices: &mut BTreeMap<u64, u64>,
+    next_tool_index: &mut u64,
 ) -> Vec<String> {
     let (event, data) = parse_sse_frame(frame);
     let Some(data) = data else {
@@ -1660,6 +1689,37 @@ fn anthropic_frame_to_openai_chunks(
                 Value::Null,
             )]
         }
+        Some("content_block_start") => {
+            let content_block = &value["content_block"];
+            if content_block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                return Vec::new();
+            }
+            let block_index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let tool_index = *next_tool_index;
+            *next_tool_index += 1;
+            tool_indices.insert(block_index, tool_index);
+            let id = content_block
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("toolu_unknown");
+            let name = content_block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            vec![openai_stream_chunk(
+                response_id,
+                model,
+                json!({
+                    "tool_calls": [{
+                        "index": tool_index,
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""}
+                    }]
+                }),
+                Value::Null,
+            )]
+        }
         Some("content_block_delta") => {
             let delta = &value["delta"];
             match delta.get("type").and_then(Value::as_str) {
@@ -1672,6 +1732,27 @@ fn anthropic_frame_to_openai_chunks(
                         response_id,
                         model,
                         json!({"content": text}),
+                        Value::Null,
+                    )]
+                }
+                Some("input_json_delta") => {
+                    let block_index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let Some(tool_index) = tool_indices.get(&block_index).copied() else {
+                        return Vec::new();
+                    };
+                    let arguments = delta
+                        .get("partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    vec![openai_stream_chunk(
+                        response_id,
+                        model,
+                        json!({
+                            "tool_calls": [{
+                                "index": tool_index,
+                                "function": {"arguments": arguments}
+                            }]
+                        }),
                         Value::Null,
                     )]
                 }
@@ -1706,20 +1787,26 @@ async fn anthropic_stream_to_openai_response(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let stream = async_stream::stream! {
         let mut upstream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut usage = TokenUsage::default();
         let mut response_id = format!("chatcmpl-anthropic-{}", unix_timestamp());
         let mut sent_done = false;
+        let mut tool_indices = BTreeMap::new();
+        let mut next_tool_index = 0_u64;
 
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let frame = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
+                    buffer.extend_from_slice(&bytes);
+                    while let Some(frame) = take_sse_frame(&mut buffer) {
                         usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
-                        for output in anthropic_frame_to_openai_chunks(&frame, &mut response_id, &model) {
+                        for output in anthropic_frame_to_openai_chunks(
+                            &frame,
+                            &mut response_id,
+                            &model,
+                            &mut tool_indices,
+                            &mut next_tool_index,
+                        ) {
                             if output.trim() == "data: [DONE]" {
                                 sent_done = true;
                             }
@@ -1734,9 +1821,16 @@ async fn anthropic_stream_to_openai_response(
             }
         }
 
-        if !buffer.trim().is_empty() {
-            usage.absorb_max(extract_token_usage_from_sse_frame(&buffer));
-            for output in anthropic_frame_to_openai_chunks(&buffer, &mut response_id, &model) {
+        if !buffer.iter().all(u8::is_ascii_whitespace) {
+            let frame = String::from_utf8_lossy(&buffer);
+            usage.absorb_max(extract_token_usage_from_sse_frame(&frame));
+            for output in anthropic_frame_to_openai_chunks(
+                &frame,
+                &mut response_id,
+                &model,
+                &mut tool_indices,
+                &mut next_tool_index,
+            ) {
                 if output.trim() == "data: [DONE]" {
                     sent_done = true;
                 }
@@ -2968,6 +3062,73 @@ mod tests {
         assert_eq!(
             anthropic_upstream_url("https://api.example.com/anthropic/v1beta", "/v1/messages"),
             "https://api.example.com/anthropic/v1beta/messages"
+        );
+    }
+
+    #[test]
+    fn sse_frames_support_crlf_and_split_utf8() {
+        let payload = "data: {\"text\":\"中\"}\r\n\r\n".as_bytes();
+        let character_start = payload
+            .windows("中".len())
+            .position(|bytes| bytes == "中".as_bytes())
+            .unwrap();
+        let mut buffer = payload[..character_start + 1].to_vec();
+        assert!(take_sse_frame(&mut buffer).is_none());
+
+        buffer.extend_from_slice(&payload[character_start + 1..]);
+        let frame = take_sse_frame(&mut buffer).unwrap();
+        assert_eq!(frame, "data: {\"text\":\"中\"}");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn anthropic_stream_tool_use_becomes_openai_tool_deltas() {
+        let mut response_id = "chatcmpl-test".to_string();
+        let mut tool_indices = BTreeMap::new();
+        let mut next_tool_index = 0;
+        let start = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,",
+            "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{}}}"
+        );
+        let delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,",
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"test\\\"}\"}}"
+        );
+
+        let start_output = anthropic_frame_to_openai_chunks(
+            start,
+            &mut response_id,
+            "test-model",
+            &mut tool_indices,
+            &mut next_tool_index,
+        );
+        let delta_output = anthropic_frame_to_openai_chunks(
+            delta,
+            &mut response_id,
+            "test-model",
+            &mut tool_indices,
+            &mut next_tool_index,
+        );
+
+        assert_eq!(next_tool_index, 1);
+        let (_, start_data) = parse_sse_frame(&start_output[0]);
+        let start_json: Value = serde_json::from_str(&start_data.unwrap()).unwrap();
+        assert_eq!(
+            start_json["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "toolu_1"
+        );
+        assert_eq!(
+            start_json["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+
+        let (_, delta_data) = parse_sse_frame(&delta_output[0]);
+        let delta_json: Value = serde_json::from_str(&delta_data.unwrap()).unwrap();
+        assert_eq!(
+            delta_json["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"test\"}"
         );
     }
 

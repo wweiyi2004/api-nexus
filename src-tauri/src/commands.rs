@@ -13,12 +13,24 @@ use tokio::time::{timeout, Duration};
 
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
+    pub config_persistence_enabled: bool,
     pub client: Client,
     pub token_stats: proxy::TokenStatsState,
     pub request_logs: proxy::RequestLogState,
     pub shutdown_tx: RwLock<Option<broadcast::Sender<()>>>,
     pub server_task: RwLock<Option<JoinHandle<()>>>,
     pub running: Arc<RwLock<bool>>,
+}
+
+fn ensure_config_persistence_enabled(state: &AppState) -> Result<(), String> {
+    if state.config_persistence_enabled {
+        Ok(())
+    } else {
+        Err(
+            "Configuration saving is disabled because config.json or secrets.dpapi could not be recovered; restart after repairing or backing up the files"
+                .to_string(),
+        )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +91,19 @@ fn default_playground_max_tokens() -> u32 {
     512
 }
 
+fn proxy_socket_address(host: &str, port: u16) -> String {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn proxy_base_url(host: &str, port: u16) -> String {
+    format!("http://{}", proxy_socket_address(host, port))
+}
+
 #[tauri::command]
 pub async fn get_config(state: tauri::State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
     let config = state.config.read().await;
@@ -91,27 +116,66 @@ pub async fn save_config_cmd(
     mut config: AppConfig,
 ) -> Result<AppConfig, String> {
     let state_arc: &Arc<AppState> = state.inner();
+    ensure_config_persistence_enabled(state_arc)?;
     config = config::normalize_config(config);
 
-    let restart_required = {
+    let (restart_required, previous_config) = {
         let current = state.config.read().await;
         let running = *state.running.read().await;
-        running
-            && (current.proxy_host != config.proxy_host || current.proxy_port != config.proxy_port)
+        (
+            running
+                && (current.proxy_host != config.proxy_host
+                    || current.proxy_port != config.proxy_port),
+            current.clone(),
+        )
     };
 
     config::save_config(&config)?;
-    state
+    if let Err(error) = state
         .request_logs
         .update_policy(config.max_log_entries, config.log_retention_days)
-        .await?;
+        .await
+    {
+        let rollback = config::save_config(&previous_config)
+            .err()
+            .map(|rollback_error| format!("; config rollback failed: {rollback_error}"))
+            .unwrap_or_default();
+        return Err(format!("Failed to update log policy: {error}{rollback}"));
+    }
     let mut current = state.config.write().await;
     *current = config.clone();
     drop(current);
 
     if restart_required {
         do_stop_proxy(state_arc).await?;
-        do_start_proxy(state_arc).await?;
+        if let Err(start_error) = do_start_proxy(state_arc).await {
+            *state.config.write().await = previous_config.clone();
+            let mut rollback_errors = Vec::new();
+            if let Err(error) = state
+                .request_logs
+                .update_policy(
+                    previous_config.max_log_entries,
+                    previous_config.log_retention_days,
+                )
+                .await
+            {
+                rollback_errors.push(format!("log policy: {error}"));
+            }
+            if let Err(error) = config::save_config(&previous_config) {
+                rollback_errors.push(format!("config: {error}"));
+            }
+            if let Err(error) = do_start_proxy(state_arc).await {
+                rollback_errors.push(format!("previous proxy: {error}"));
+            }
+            let rollback = if rollback_errors.is_empty() {
+                "previous configuration restored".to_string()
+            } else {
+                format!("rollback errors: {}", rollback_errors.join("; "))
+            };
+            return Err(format!(
+                "Failed to restart proxy: {start_error}; {rollback}"
+            ));
+        }
     }
 
     Ok(config)
@@ -122,6 +186,7 @@ pub async fn add_provider(
     state: tauri::State<'_, Arc<AppState>>,
     provider: Provider,
 ) -> Result<AppConfig, String> {
+    ensure_config_persistence_enabled(state.inner())?;
     let mut config = state.config.write().await;
     config.providers.push(provider);
     *config = config::normalize_config(config.clone());
@@ -134,6 +199,7 @@ pub async fn update_provider(
     state: tauri::State<'_, Arc<AppState>>,
     provider: Provider,
 ) -> Result<AppConfig, String> {
+    ensure_config_persistence_enabled(state.inner())?;
     let mut config = state.config.write().await;
     let found = config.providers.iter_mut().find(|p| p.id == provider.id);
     if found.is_none() {
@@ -152,6 +218,7 @@ pub async fn remove_provider(
     state: tauri::State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<AppConfig, String> {
+    ensure_config_persistence_enabled(state.inner())?;
     let mut config = state.config.write().await;
     config.providers.retain(|p| p.id != id);
     *config = config::normalize_config(config.clone());
@@ -169,7 +236,7 @@ pub async fn get_server_status(
         running,
         port: config.proxy_port,
         host: config.proxy_host.clone(),
-        url: format!("http://{}:{}", config.proxy_host, config.proxy_port),
+        url: proxy_base_url(&config.proxy_host, config.proxy_port),
     })
 }
 
@@ -260,7 +327,7 @@ pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, Strin
     let (addr, config_arc) = {
         let config = state.config.read().await;
         (
-            format!("{}:{}", config.proxy_host, config.proxy_port),
+            proxy_socket_address(&config.proxy_host, config.proxy_port),
             state.config.clone(),
         )
     };
@@ -297,7 +364,7 @@ pub async fn do_start_proxy(state: &Arc<AppState>) -> Result<ServerStatus, Strin
         running: true,
         port: config.proxy_port,
         host: config.proxy_host.clone(),
-        url: format!("http://{}:{}", config.proxy_host, config.proxy_port),
+        url: proxy_base_url(&config.proxy_host, config.proxy_port),
     })
 }
 
@@ -796,6 +863,14 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (addr, handle)
+    }
+
+    #[test]
+    fn proxy_addresses_bracket_ipv6_hosts() {
+        assert_eq!(proxy_socket_address("::1", 11434), "[::1]:11434");
+        assert_eq!(proxy_socket_address("[::1]", 11434), "[::1]:11434");
+        assert_eq!(proxy_base_url("::1", 11434), "http://[::1]:11434");
+        assert_eq!(proxy_base_url("127.0.0.1", 11434), "http://127.0.0.1:11434");
     }
 
     #[test]

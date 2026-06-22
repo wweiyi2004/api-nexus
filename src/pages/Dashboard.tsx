@@ -81,6 +81,12 @@ function formatTokens(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
+function proxyBaseUrl(host: string, port: number) {
+  const normalizedHost = host.trim().replace(/^\[(.*)\]$/, "$1");
+  const urlHost = normalizedHost.includes(":") ? `[${normalizedHost}]` : normalizedHost;
+  return `http://${urlHost}:${port}`;
+}
+
 function RunningWave({ active }: { active: boolean }) {
   return (
     <div
@@ -193,7 +199,8 @@ export default function Dashboard() {
     return [...map.entries()].sort((a, b) => (b[1].input + b[1].output + b[1].cacheRead + b[1].cacheWrite) - (a[1].input + a[1].output + a[1].cacheRead + a[1].cacheWrite));
   }, [logs]);
 
-  const baseUrl = status?.url ?? `http://${config?.proxy_host ?? "127.0.0.1"}:${config?.proxy_port ?? 11434}`;
+  const baseUrl = status?.url
+    ?? proxyBaseUrl(config?.proxy_host ?? "127.0.0.1", config?.proxy_port ?? 11434);
 
   if (loading) {
     return (
